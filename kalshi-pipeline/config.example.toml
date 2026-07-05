@@ -1,0 +1,13 @@
+# Paper-trader config. Copy to config.toml and fill in.
+# Get an API key at kalshi.com -> Account -> API keys. Download the RSA private
+# key file; NEVER commit it or paste it into chat.
+
+key_id = "your-key-id-here"
+private_key_path = "kalshi_private_key.pem"
+
+size = 10.0            # contracts per signal
+hold_minutes = 5       # drift horizon from the pilot study
+exit_timeout_s = 120   # maker exit wait before crossing the spread
+max_spread_cents = 2   # skip signals on wide books
+entry_events = ["home_run", "single", "double", "triple", "walk", "hit_by_pitch"]
+log_path = "paper_trades.csv"

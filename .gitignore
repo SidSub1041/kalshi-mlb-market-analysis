@@ -1,0 +1,13 @@
+# build artifacts
+kalshi-pipeline/target/
+__pycache__/
+*.pyc
+
+# secrets — never commit
+kalshi-pipeline/config.toml
+*.pem
+
+# bulk collected data (keep pilot data/ tracked; season pull is regenerable)
+kalshi-pipeline/data_full/
+paper_trades.csv
+oos_preds.csv

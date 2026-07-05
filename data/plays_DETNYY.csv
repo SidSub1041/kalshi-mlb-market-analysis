@@ -1,0 +1,73 @@
+end_time,inning,half,event_type,event,rbi,away_score,home_score,is_scoring
+2026-06-30T23:12:49.250Z,1,top,strikeout,Strikeout,0,0,0,false
+2026-06-30T23:14:10.327Z,1,top,field_out,Flyout,0,0,0,false
+2026-06-30T23:15:23.848Z,1,top,home_run,Home Run,1,1,0,true
+2026-06-30T23:17:21.856Z,1,top,home_run,Home Run,1,2,0,true
+2026-06-30T23:19:37.580Z,1,top,single,Single,0,2,0,false
+2026-06-30T23:24:42.198Z,1,top,home_run,Home Run,2,4,0,true
+2026-06-30T23:27:21.337Z,1,top,field_out,Flyout,0,4,0,false
+2026-06-30T23:30:41.595Z,1,bottom,field_out,Pop Out,0,4,0,false
+2026-06-30T23:31:23.685Z,1,bottom,field_out,Groundout,0,4,0,false
+2026-06-30T23:32:59.950Z,1,bottom,home_run,Home Run,1,4,1,true
+2026-06-30T23:33:53.572Z,1,bottom,field_out,Flyout,0,4,1,false
+2026-06-30T23:38:14.361Z,2,top,strikeout,Strikeout,0,4,1,false
+2026-06-30T23:40:30.426Z,2,top,strikeout,Strikeout,0,4,1,false
+2026-06-30T23:41:31.523Z,2,top,field_out,Flyout,0,4,1,false
+2026-06-30T23:45:16.255Z,2,bottom,strikeout,Strikeout,0,4,1,false
+2026-06-30T23:47:15.539Z,2,bottom,strikeout,Strikeout,0,4,1,false
+2026-06-30T23:48:04.140Z,2,bottom,field_out,Groundout,0,4,1,false
+2026-06-30T23:50:54.474Z,3,top,single,Single,0,4,1,false
+2026-06-30T23:51:49.868Z,3,top,field_out,Lineout,0,4,1,false
+2026-06-30T23:52:57.826Z,3,top,home_run,Home Run,2,6,1,true
+2026-06-30T23:54:49.238Z,3,top,strikeout,Strikeout,0,6,1,false
+2026-06-30T23:55:59.169Z,3,top,strikeout,Strikeout,0,6,1,false
+2026-07-01T00:01:00.727Z,3,bottom,field_out,Flyout,0,6,1,false
+2026-07-01T00:03:11.364Z,3,bottom,strikeout,Strikeout,0,6,1,false
+2026-07-01T00:04:47.934Z,3,bottom,strikeout,Strikeout,0,6,1,false
+2026-07-01T00:07:31.455Z,4,top,field_out,Flyout,0,6,1,false
+2026-07-01T00:10:46.231Z,4,top,walk,Walk,0,6,1,false
+2026-07-01T00:12:45.761Z,4,top,field_out,Flyout,0,6,1,false
+2026-07-01T00:14:01.633Z,4,top,field_out,Flyout,0,6,1,false
+2026-07-01T00:17:44.038Z,4,bottom,strikeout,Strikeout,0,6,1,false
+2026-07-01T00:19:10.535Z,4,bottom,strikeout,Strikeout,0,6,1,false
+2026-07-01T00:22:24.295Z,4,bottom,strikeout,Strikeout,0,6,1,false
+2026-07-01T00:26:03.008Z,5,top,double,Double,0,6,1,false
+2026-07-01T00:29:16.251Z,5,top,field_out,Flyout,0,6,1,false
+2026-07-01T00:30:07.046Z,5,top,field_out,Lineout,0,6,1,false
+2026-07-01T00:32:29.000Z,5,top,field_out,Groundout,0,6,1,false
+2026-07-01T00:35:24.258Z,5,bottom,field_out,Bunt Groundout,0,6,1,false
+2026-07-01T00:37:37.994Z,5,bottom,strikeout,Strikeout,0,6,1,false
+2026-07-01T00:38:55.621Z,5,bottom,strikeout,Strikeout,0,6,1,false
+2026-07-01T00:42:14.723Z,6,top,single,Single,0,6,1,false
+2026-07-01T00:43:16.227Z,6,top,fielders_choice,Fielders Choice,0,6,1,false
+2026-07-01T00:44:14.580Z,6,top,home_run,Home Run,3,9,1,true
+2026-07-01T00:45:27.765Z,6,top,field_out,Groundout,0,9,1,false
+2026-07-01T00:47:50.747Z,6,top,field_out,Flyout,0,9,1,false
+2026-07-01T00:48:35.652Z,6,top,field_out,Flyout,0,9,1,false
+2026-07-01T00:51:50.237Z,6,bottom,hit_by_pitch,Hit By Pitch,0,9,1,false
+2026-07-01T00:53:32.128Z,6,bottom,fielders_choice,Fielders Choice,0,9,1,false
+2026-07-01T00:55:16.945Z,6,bottom,grounded_into_double_play,Grounded Into DP,0,9,2,true
+2026-07-01T00:57:25.554Z,6,bottom,field_out,Pop Out,0,9,2,false
+2026-07-01T01:01:55.853Z,7,top,strikeout,Strikeout,0,9,2,false
+2026-07-01T01:03:15.217Z,7,top,strikeout,Strikeout,0,9,2,false
+2026-07-01T01:04:07.038Z,7,top,field_out,Pop Out,0,9,2,false
+2026-07-01T01:10:16.194Z,7,bottom,strikeout,Strikeout,0,9,2,false
+2026-07-01T01:11:59.807Z,7,bottom,single,Single,0,9,2,false
+2026-07-01T01:14:30.705Z,7,bottom,force_out,Forceout,0,9,2,false
+2026-07-01T01:16:34.670Z,7,bottom,force_out,Forceout,0,9,2,false
+2026-07-01T01:20:18.009Z,8,top,strikeout,Strikeout,0,9,2,false
+2026-07-01T01:20:39.350Z,8,top,field_out,Flyout,0,9,2,false
+2026-07-01T01:22:20.885Z,8,top,field_out,Groundout,0,9,2,false
+2026-07-01T01:26:42.960Z,8,bottom,strikeout,Strikeout,0,9,2,false
+2026-07-01T01:27:55.163Z,8,bottom,field_out,Flyout,0,9,2,false
+2026-07-01T01:30:35.706Z,8,bottom,field_out,Flyout,0,9,2,false
+2026-07-01T01:34:04.890Z,9,top,single,Single,0,9,2,false
+2026-07-01T01:34:55.374Z,9,top,single,Single,0,9,2,false
+2026-07-01T01:35:46.171Z,9,top,field_out,Pop Out,0,9,2,false
+2026-07-01T01:36:21.399Z,9,top,grounded_into_double_play,Grounded Into DP,0,9,2,false
+2026-07-01T01:39:46.137Z,9,bottom,field_out,Groundout,0,9,2,false
+2026-07-01T01:41:20.907Z,9,bottom,walk,Walk,0,9,2,false
+2026-07-01T01:42:13.626Z,9,bottom,field_out,Flyout,0,9,2,false
+2026-07-01T01:43:15.875Z,9,bottom,single,Single,1,9,3,true
+2026-07-01T01:45:59.601Z,9,bottom,single,Single,0,9,3,false
+2026-07-01T01:49:13.461Z,9,bottom,field_out,Pop Out,0,9,3,false
