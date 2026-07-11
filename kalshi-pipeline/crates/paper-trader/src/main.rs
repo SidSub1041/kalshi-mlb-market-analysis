@@ -436,8 +436,8 @@ async fn main() -> Result<()> {
     }
     let mut log = csv::Writer::from_path(&cfg.log_path)?;
     log.write_record([
-        "ts", "ticker", "action", "price_cents", "size", "fair_model_cents",
-        "fair_blend_cents", "detail", "pnl_cents", "fees",
+        "ts", "ticker", "action", "price_cents", "size", "cost_cents",
+        "fair_model_cents", "fair_blend_cents", "detail", "pnl_cents", "fees",
     ])?;
     log.flush()?;
     let mut adapt = Adapt::load("adapt_state.json", cfg.entry_edge_cents);
@@ -524,13 +524,16 @@ async fn main() -> Result<()> {
                         adapt.record(pnl);
                         log.write_record([
                             now.to_rfc3339(), ticker.clone(), "settle".into(),
-                            px.to_string(), format!("{qty}"),
+                            px.to_string(), format!("{qty}"), format!("{cost:.0}"),
                             format!("{:.1}", pos.fair_c.unwrap_or_default()),
                             String::new(),
                             pos.detail.clone(), format!("{pnl:.1}"), "0.00".into(),
                         ])?;
                         log.flush()?;
-                        tracing::info!(%ticker, won, pnl_cents = pnl, "settled at game end");
+                        tracing::info!(%ticker, won, pnl_cents = pnl,
+                                       invested_cents = cost,
+                                       ret_pct = format!("{:+.0}", pnl / cost * 100.0),
+                                       "settled at game end");
                     }
                     pos.clips.clear();
                     pos.entry = None;
@@ -561,16 +564,19 @@ async fn main() -> Result<()> {
             let o = pos.entry.take().unwrap();
             pos.clips.push((o.price, o.size));
             pos.last_fill_seq = pos.fair_seq;
+            let clip_cost = o.price as f64 * o.size;
+            let pos_cost: f64 = pos.clips.iter().map(|(p, s)| *p as f64 * s).sum();
             log.write_record([
                 now.to_rfc3339(), t.clone(),
                 if pos.clips.len() > 1 { "add".into() } else { "entry".to_string() },
-                o.price.to_string(), format!("{}", o.size),
+                o.price.to_string(), format!("{}", o.size), format!("{clip_cost:.0}"),
                 format!("{:.1}", fair_model.unwrap_or_default()),
                 format!("{:.1}", fair_blend.unwrap_or_default()),
                 pos.detail.clone(), String::new(), "0.00".into(),
             ])?;
             log.flush()?;
             tracing::info!(ticker = %t, price = o.price, clips = pos.clips.len(),
+                           invested_cents = pos_cost,
                            fair = fair_model.unwrap_or_default(), "entry filled");
         }
         if pos.exit.as_ref().is_some_and(|o| o.state == OrderState::Filled) {
@@ -583,13 +589,15 @@ async fn main() -> Result<()> {
             adapt.record(pnl);
             log.write_record([
                 now.to_rfc3339(), t.clone(), "exit_maker".into(),
-                o.price.to_string(), format!("{qty}"),
+                o.price.to_string(), format!("{qty}"), format!("{cost:.0}"),
                 format!("{:.1}", fair_model.unwrap_or_default()),
                 format!("{:.1}", fair_blend.unwrap_or_default()),
                 pos.detail.clone(), format!("{pnl:.1}"), "0.00".into(),
             ])?;
             log.flush()?;
             tracing::info!(ticker = %t, exit = o.price, pnl_cents = pnl,
+                           invested_cents = cost,
+                           ret_pct = format!("{:+.0}", pnl / cost.max(1.0) * 100.0),
                            "position closed (maker)");
         }
 
@@ -640,13 +648,15 @@ async fn main() -> Result<()> {
                 adapt.record(pnl);
                 log.write_record([
                     now.to_rfc3339(), t.clone(), "exit_taker".into(),
-                    bid.to_string(), format!("{qty}"),
+                    bid.to_string(), format!("{qty}"), format!("{cost:.0}"),
                     format!("{:.1}", fair_model.unwrap_or_default()),
                     format!("{fair:.1}"), pos.detail.clone(),
                     format!("{pnl:.1}"), format!("{fee:.2}"),
                 ])?;
                 log.flush()?;
                 tracing::info!(ticker = %t, exit = bid, pnl_cents = pnl,
+                               invested_cents = cost,
+                               ret_pct = format!("{:+.0}", pnl / cost.max(1.0) * 100.0),
                                "position dumped (taker, model flipped)");
             } else if pos.exit.is_none() && ask as f64 >= fair + cfg.exit_edge_cents {
                 // maker exit: the ask is now above blended fair -> sell into it
