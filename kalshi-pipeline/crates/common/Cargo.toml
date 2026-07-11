@@ -11,6 +11,7 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+csv = { workspace = true }
 # auth signing for websocket / authed endpoints
 rsa = { version = "0.9", features = ["sha2"] }
 rand_core = { version = "0.6", features = ["std", "getrandom"] }
