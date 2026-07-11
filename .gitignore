@@ -6,8 +6,13 @@ __pycache__/
 # secrets — never commit
 kalshi-pipeline/config.toml
 *.pem
+*.pem.*
 
 # bulk collected data (keep pilot data/ tracked; season pull is regenerable)
 kalshi-pipeline/data_full/
-paper_trades.csv
+paper_trades*.csv
 oos_preds.csv
+
+# runtime artifacts
+paper_trader_live.log
+adapt_state.json

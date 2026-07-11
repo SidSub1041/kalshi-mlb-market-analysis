@@ -280,6 +280,7 @@ pub mod auth {
     use rsa::signature::{RandomizedSigner, SignatureEncoding};
     use rsa::RsaPrivateKey;
 
+    #[derive(Clone)]
     pub struct Signer {
         pub key_id: String,
         key: RsaPrivateKey,
@@ -445,6 +446,35 @@ impl MlbClient {
         Ok(Self::plays_from_gumbo(&v))
     }
 
+    /// Same as `gumbo_plays` but with a fields filter so the response carries
+    /// only what `plays_from_gumbo` reads (~50-100x smaller than the full
+    /// feed). Use for latency-sensitive polling.
+    pub async fn gumbo_plays_slim(&self, game_pk: i64) -> Result<Vec<PlayRow>> {
+        let url = format!(
+            "{MLB_BASE}/api/v1.1/game/{game_pk}/feed/live?fields=liveData,plays,allPlays,\
+             about,atBatIndex,isComplete,endTime,halfInning,inning,isScoringPlay,\
+             result,event,eventType,rbi,awayScore,homeScore,count,outs,\
+             matchup,postOnFirst,postOnSecond,postOnThird,playEvents,startTime"
+        );
+        let v = self.get(&url).await?;
+        Ok(Self::plays_from_gumbo(&v))
+    }
+
+    /// Plays plus the game's abstract state ("Live", "Final", "Preview").
+    pub async fn gumbo_plays_status(&self, game_pk: i64) -> Result<(Vec<PlayRow>, String)> {
+        let url = format!(
+            "{MLB_BASE}/api/v1.1/game/{game_pk}/feed/live?fields=gameData,status,\
+             abstractGameState,liveData,plays,allPlays,\
+             about,atBatIndex,isComplete,endTime,halfInning,inning,isScoringPlay,\
+             result,event,eventType,rbi,awayScore,homeScore,count,outs,\
+             matchup,postOnFirst,postOnSecond,postOnThird,playEvents,startTime"
+        );
+        let v = self.get(&url).await?;
+        let status = v["gameData"]["status"]["abstractGameState"]
+            .as_str().unwrap_or("").to_string();
+        Ok((Self::plays_from_gumbo(&v), status))
+    }
+
     /// Pure function so it can be unit-tested on a fixture file.
     pub fn plays_from_gumbo(v: &serde_json::Value) -> Vec<PlayRow> {
         let mut out = Vec::new();
@@ -484,6 +514,94 @@ impl MlbClient {
     }
 }
 
+/// In-game win-probability model, ported from wp_model.py (backtested on the
+/// 2026 season: Brier 0.157 at plays; model-vs-market gaps >=10c predicted
+/// ~+3c/contract net of taker fees). Keep in sync with the Python reference.
+pub mod wp {
+    use super::PlayRow;
+    use std::collections::HashMap;
+
+    /// RE24 run-expectancy: (outs, on1, on2, on3) -> expected runs, rest of inning.
+    const RE24: [((i64, bool, bool, bool), f64); 24] = [
+        ((0,false,false,false),0.481),((0,true,false,false),0.859),
+        ((0,false,true,false),1.100),((0,false,false,true),1.350),
+        ((0,true,true,false),1.437),((0,true,false,true),1.784),
+        ((0,false,true,true),1.964),((0,true,true,true),2.292),
+        ((1,false,false,false),0.254),((1,true,false,false),0.509),
+        ((1,false,true,false),0.664),((1,false,false,true),0.950),
+        ((1,true,true,false),0.884),((1,true,false,true),1.130),
+        ((1,false,true,true),1.376),((1,true,true,true),1.541),
+        ((2,false,false,false),0.098),((2,true,false,false),0.224),
+        ((2,false,true,false),0.319),((2,false,false,true),0.353),
+        ((2,true,true,false),0.429),((2,true,false,true),0.478),
+        ((2,false,true,true),0.580),((2,true,true,true),0.752),
+    ];
+    const LEAGUE_HALF_MU: f64 = 0.481;
+    const HALF_VAR: f64 = 1.12;
+    const HOME_EDGE: f64 = 0.035;
+    /// Logistic calibration fit on the full 2026 season (wp_model.py).
+    pub const CALIB_A: f64 = 0.0223;
+    pub const CALIB_B: f64 = 1.8967;
+
+    fn re24(outs: i64, on1: bool, on2: bool, on3: bool) -> f64 {
+        RE24.iter().find(|(k, _)| *k == (outs, on1, on2, on3))
+            .map(|(_, v)| *v).unwrap_or(LEAGUE_HALF_MU)
+    }
+
+    /// team -> (offense, defense) rating, 1.0 = league average.
+    pub struct Ratings(HashMap<String, (f64, f64)>);
+
+    impl Ratings {
+        pub fn from_csv(path: &str) -> anyhow::Result<Self> {
+            let mut m = HashMap::new();
+            let mut rdr = csv::Reader::from_path(path)?;
+            for rec in rdr.records() {
+                let r = rec?;
+                m.insert(r[0].to_string(),
+                         (r[1].parse::<f64>()?, r[2].parse::<f64>()?));
+            }
+            Ok(Self(m))
+        }
+        pub fn get(&self, team: &str) -> (f64, f64) {
+            self.0.get(team).copied().unwrap_or((1.0, 1.0))
+        }
+    }
+
+    /// P(home team wins) given the state after `play`. Mirrors
+    /// wp_model.py::wp_features + logistic calibration.
+    pub fn wp_home(play: &PlayRow, ratings: &Ratings, away: &str, home: &str) -> f64 {
+        let (o_h, d_h) = ratings.get(home);
+        let (o_a, d_a) = ratings.get(away);
+        let mu_h = LEAGUE_HALF_MU * o_h * d_a;
+        let mu_a = LEAGUE_HALF_MU * o_a * d_h;
+
+        let lead = (play.home_score - play.away_score) as f64;
+        let (mut outs, mut on) =
+            (play.outs_after, (play.on1_after, play.on2_after, play.on3_after));
+        let mid_inning_done = outs >= 3;
+        if mid_inning_done { outs = 0; on = (false, false, false); }
+
+        let inn = play.inning.min(9);
+        let (rem_a, rem_h, partial, partial_side): (f64, f64, f64, f64) =
+            if play.half == "top" {
+                let (ra, rh) = ((9 - inn) as f64, (9 - inn + 1) as f64);
+                if mid_inning_done { (ra, rh, 0.0, 0.0) }
+                else { (ra, rh, re24(outs, on.0, on.1, on.2) * (o_a * d_h), -1.0) }
+            } else {
+                let (ra, rh) = ((9 - inn) as f64, (9 - inn) as f64);
+                if mid_inning_done { (ra, rh, 0.0, 0.0) }
+                else { (ra, rh, re24(outs, on.0, on.1, on.2) * (o_h * d_a), 1.0) }
+            };
+
+        let exp_diff = lead + rem_h * mu_h - rem_a * mu_a
+            + partial_side * partial + HOME_EDGE;
+        let n_half = (rem_a + rem_h + if partial_side == 0.0 { 0.0 } else { 1.0 })
+            .max(1.0);
+        let z = exp_diff / (n_half * HALF_VAR).sqrt();
+        1.0 / (1.0 + (-(CALIB_A + CALIB_B * z)).exp())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +615,30 @@ mod tests {
         // 2-then-3 split: AZ vs SEA
         let (_, a, h) = parse_event_teams("KXMLBGAME-26MAY302210AZSEA").unwrap();
         assert_eq!((a.as_str(), h.as_str()), ("AZ", "SEA"));
+    }
+
+    #[test]
+    fn wp_matches_python_reference() {
+        let ratings = wp::Ratings::from_csv("/nonexistent").unwrap_or_else(|_| {
+            // neutral ratings when file absent (get() defaults to 1.0)
+            wp::Ratings::from_csv("/dev/null").unwrap()
+        });
+        let mk = |inning, half: &str, outs, on1, on2, on3, a, h| PlayRow {
+            at_bat_index: 0, inning, half: half.into(), event: String::new(),
+            event_type: String::new(), rbi: 0, away_score: a, home_score: h,
+            is_scoring: false, end_time: String::new(), decisive_time: String::new(),
+            outs_after: outs, on1_after: on1, on2_after: on2, on3_after: on3,
+        };
+        // reference values from wp_model.py with neutral ratings
+        let cases = [
+            (mk(1, "top", 0, false, false, false, 0, 0), 0.50927),
+            (mk(9, "bottom", 2, false, false, false, 3, 5), 0.979063),
+            (mk(7, "top", 1, true, true, false, 2, 4), 0.771426),
+        ];
+        for (play, want) in cases {
+            let got = wp::wp_home(&play, &ratings, "AWY", "HOM");
+            assert!((got - want).abs() < 1e-4, "got {got}, want {want}");
+        }
     }
 
     #[test]

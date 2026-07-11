@@ -1,10 +1,16 @@
 //! Live paper trader — places NO real orders. Simulates maker-side entries on
-//! Kalshi MLB moneyline markets after scoring plays, using the live websocket
-//! order book + trade tape for fill simulation, and MLB GUMBO polling for signals.
+//! Kalshi MLB moneyline markets, using the live websocket order book + trade
+//! tape for fill simulation, and MLB GUMBO polling for game state.
 //!
-//! Strategy (from the pilot event study): after a scoring play, the batting
-//! team's price keeps drifting up for ~5 min. We join the best bid (maker, no
-//! taker fee), hold `hold_minutes`, then exit.
+//! Strategy (v2, fair-value): a state-based win-probability model (common::wp,
+//! backtested on the full 2026 season) prices every market continuously from
+//! score/inning/outs/runners + season team strength. When the model's fair
+//! value diverges from the book by >= `entry_edge_cents`, join the bid
+//! (maker). Add clips if the edge widens (averaging down), up to `max_clips`.
+//! Exit maker when the ask rises above fair value, dump taker if the model
+//! flips hard against the position, and settle at 0/100 when the game ends.
+//! Entry/exit thresholds are net of the Kalshi taker fee where a taker exit
+//! is the realistic outcome.
 //!
 //! Fill model (honest bounds):
 //!   queue-ahead = displayed size at our level when we "place"; we fill after
@@ -18,7 +24,7 @@
 //! this binary cannot place orders even by accident: it never calls POST.
 
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
+use chrono::{Duration as ChronoDur, Utc};
 use clap::Parser;
 use common::{auth::Signer, KalshiClient, MlbClient, PlayRow, KALSHI_WS};
 use futures_util::{SinkExt, StreamExt};
@@ -49,11 +55,25 @@ struct Config {
     /// only trade when spread (cents) is at most this
     #[serde(default = "d_spread")]
     max_spread_cents: i64,
-    /// which event types trigger entries
+    /// which event types trigger entries (v1 strategy; unused by fair-value v2)
     #[serde(default = "d_events")]
+    #[allow(dead_code)]
     entry_events: Vec<String>,
     #[serde(default = "d_log")]
     log_path: String,
+    /// model-vs-bid divergence (cents) required to enter / add a clip.
+    /// Backtest: only >=10c gaps stayed profitable net of fees.
+    #[serde(default = "d_entry_edge")]
+    entry_edge_cents: f64,
+    /// remaining edge (cents) below which resting orders are cancelled and
+    /// maker exits are placed.
+    #[serde(default = "d_exit_edge")]
+    exit_edge_cents: f64,
+    /// max clips (size-sized buys) per market — caps averaging down
+    #[serde(default = "d_max_clips")]
+    max_clips: usize,
+    #[serde(default = "d_ratings")]
+    ratings_path: String,
 }
 fn d_size() -> f64 { 10.0 }
 fn d_hold() -> i64 { 5 }
@@ -64,6 +84,20 @@ fn d_events() -> Vec<String> {
         .iter().map(|s| s.to_string()).collect()
 }
 fn d_log() -> String { "paper_trades.csv".into() }
+fn d_entry_edge() -> f64 { 10.0 }
+fn d_exit_edge() -> f64 { 2.0 }
+fn d_max_clips() -> usize { 2 }
+fn d_ratings() -> String { "ratings.csv".into() }
+
+/// Weight of the model in the fair-value blend; the rest is market mid.
+/// 0.5 was the best Brier in the season backtest (beats model and market).
+const BLEND_W: f64 = 0.5;
+/// Stop opening new positions on a market after this much realized loss (cents).
+const MARKET_LOSS_STOP_C: f64 = -300.0;
+/// Adaptive entry threshold bounds (cents) and P&L window (closed positions).
+const THR_MIN: f64 = 8.0;
+const THR_MAX: f64 = 15.0;
+const THR_WINDOW: usize = 5;
 
 // ---------------------------------------------------------------- order book
 
@@ -132,10 +166,27 @@ enum Tick {
     Trade(String, i64, f64, String),
     Delta(String, String, i64, f64),
     Snapshot(String, Vec<(i64, f64)>, Vec<(i64, f64)>),
-    Signal { ticker: String, event: String, detail: String },
+    /// model fair value for a market (cents), refreshed on every new play
+    Fair { ticker: String, fair_c: f64, detail: String },
+    /// game ended; `won` = this market's team won
+    Settle { ticker: String, won: bool },
 }
 
 // ---------------------------------------------------------------- ws task
+
+/// Kalshi ws now sends prices as fixed-point dollar strings ("0.5300");
+/// older payloads used integer cents. Accept both, normalized to cents.
+fn dollars_to_cents(v: &serde_json::Value) -> Option<i64> {
+    v.as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|d| (d * 100.0).round() as i64)
+        .or_else(|| v.as_i64())
+}
+
+/// Quantities arrive as fp strings ("181.00") or plain numbers.
+fn fp_qty(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
 
 async fn ws_task(signer: Signer, tickers: Vec<String>, tx: mpsc::Sender<Tick>) -> Result<()> {
     let (ts, sig) = signer.headers("GET", "/trade-api/ws/v2")?;
@@ -154,41 +205,51 @@ async fn ws_task(signer: Signer, tickers: Vec<String>, tx: mpsc::Sender<Tick>) -
     sink.send(Message::Text(sub.to_string())).await?;
     tracing::info!("ws subscribed");
 
-    while let Some(msg) = stream.next().await {
+    // A socket can go "zombie" (open but silent) across Kalshi's overnight
+    // maintenance; treat prolonged silence as death so the caller reconnects.
+    loop {
+        let msg = match tokio::time::timeout(
+            std::time::Duration::from_secs(300), stream.next()).await
+        {
+            Err(_) => return Err(anyhow!("ws silent for 5 min; assuming zombie")),
+            Ok(None) => break,
+            Ok(Some(m)) => m,
+        };
         let Message::Text(txt) = msg? else { continue };
-        let v: serde_json::Value = serde_json::from_str(&txt)?;
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
         match v["type"].as_str().unwrap_or("") {
             "orderbook_snapshot" => {
                 let m = &v["msg"];
-                let parse = |k: &str| -> Vec<(i64, f64)> {
-                    m[k].as_array().unwrap_or(&vec![]).iter()
-                        .filter_map(|lv| {
-                            Some((lv[0].as_i64()?,
-                                  lv[1].as_f64().or_else(|| lv[1].as_str()?.parse().ok())?))
-                        }).collect()
+                let parse = |fp_key: &str, legacy_key: &str| -> Vec<(i64, f64)> {
+                    let levels = m[fp_key].as_array()
+                        .or_else(|| m[legacy_key].as_array());
+                    levels.map(|a| a.iter()
+                        .filter_map(|lv| Some((dollars_to_cents(&lv[0])?, fp_qty(&lv[1])?)))
+                        .collect()).unwrap_or_default()
                 };
                 tx.send(Tick::Snapshot(
                     m["market_ticker"].as_str().unwrap_or("").into(),
-                    parse("yes"), parse("no"),
+                    parse("yes_dollars_fp", "yes"), parse("no_dollars_fp", "no"),
                 )).await.ok();
             }
             "orderbook_delta" => {
                 let m = &v["msg"];
+                let price = dollars_to_cents(&m["price_dollars"])
+                    .or_else(|| m["price"].as_i64()).unwrap_or(0);
+                let delta = fp_qty(&m["delta_fp"])
+                    .or_else(|| fp_qty(&m["delta"])).unwrap_or(0.0);
                 tx.send(Tick::Delta(
                     m["market_ticker"].as_str().unwrap_or("").into(),
                     m["side"].as_str().unwrap_or("yes").into(),
-                    m["price"].as_i64().unwrap_or(0),
-                    m["delta"].as_f64()
-                        .or_else(|| m["delta"].as_str().and_then(|s| s.parse().ok()))
-                        .unwrap_or(0.0),
+                    price, delta,
                 )).await.ok();
             }
             "trade" => {
                 let m = &v["msg"];
-                let price = m["yes_price"].as_i64().unwrap_or(0);
-                let count = m["count"].as_f64()
-                    .or_else(|| m["count_fp"].as_str().and_then(|s| s.parse().ok()))
-                    .unwrap_or(0.0);
+                let price = dollars_to_cents(&m["yes_price_dollars"])
+                    .or_else(|| m["yes_price"].as_i64()).unwrap_or(0);
+                let count = fp_qty(&m["count_fp"])
+                    .or_else(|| fp_qty(&m["count"])).unwrap_or(0.0);
                 tx.send(Tick::Trade(
                     m["market_ticker"].as_str().unwrap_or("").into(),
                     price, count,
@@ -203,36 +264,81 @@ async fn ws_task(signer: Signer, tickers: Vec<String>, tx: mpsc::Sender<Tick>) -
 
 // ---------------------------------------------------------------- gumbo poll
 
-/// Polls each live game's GUMBO feed every ~3 s; emits a Signal for each new
-/// completed play whose event_type is in `entry_events`. The signal names the
-/// market of the BATTING team.
+/// Game handle for the poller: (game_pk, away_ab, home_ab, away_ticker, home_ticker)
+type Game = (i64, String, String, String, String);
+
+/// Polls each live game's GUMBO feed every ~3 s; recomputes model fair value
+/// after every new completed play and emits it for both team markets. Emits
+/// Settle when a game goes Final.
 async fn gumbo_task(
-    games: Vec<(i64, String, String)>, // (game_pk, away_ticker, home_ticker)
-    entry_events: Vec<String>,
+    games: Vec<Game>,
+    ratings: common::wp::Ratings,
     tx: mpsc::Sender<Tick>,
 ) -> Result<()> {
     let mlb = MlbClient::new()?;
     let mut seen: HashMap<i64, i64> = HashMap::new(); // game_pk -> last atBatIndex
+    let mut done: HashMap<i64, bool> = HashMap::new();
+
+    let send_fair = |p: &PlayRow, g: &Game, tx: mpsc::Sender<Tick>| {
+        let (_, away, home, away_t, home_t) = g.clone();
+        let wp_h = common::wp::wp_home(p, &ratings, &away, &home);
+        let detail = format!("inn{} {} {}-{} outs{}", p.inning, p.half,
+                             p.away_score, p.home_score, p.outs_after.min(3));
+        async move {
+            if !home_t.is_empty() {
+                tx.send(Tick::Fair { ticker: home_t, fair_c: wp_h * 100.0,
+                                     detail: detail.clone() }).await.ok();
+            }
+            if !away_t.is_empty() {
+                tx.send(Tick::Fair { ticker: away_t, fair_c: (1.0 - wp_h) * 100.0,
+                                     detail }).await.ok();
+            }
+        }
+    };
+
+    // Prime: current state -> initial fair values, no replay of old plays.
+    for g in &games {
+        if let Ok(plays) = mlb.gumbo_plays_slim(g.0).await {
+            let max_idx = plays.iter().map(|p| p.at_bat_index).max().unwrap_or(-1);
+            seen.insert(g.0, max_idx);
+            if let Some(p) = plays.last() {
+                send_fair(p, g, tx.clone()).await;
+            }
+        }
+    }
+    tracing::info!(n_games = games.len(), "gumbo primed; pricing every new play");
     loop {
-        for (pk, away_t, home_t) in &games {
-            let plays: Vec<PlayRow> = match mlb.gumbo_plays(*pk).await {
-                Ok(p) => p,
-                Err(e) => { tracing::warn!(pk, %e, "gumbo poll failed"); continue; }
+        let polls = games.iter()
+            .filter(|g| !done.get(&g.0).copied().unwrap_or(false))
+            .map(|g| mlb.gumbo_plays_status(g.0));
+        let live: Vec<&Game> = games.iter()
+            .filter(|g| !done.get(&g.0).copied().unwrap_or(false)).collect();
+        if live.is_empty() {
+            tracing::info!("all games final; gumbo task idle");
+            return Ok(());
+        }
+        let results = futures_util::future::join_all(polls).await;
+        for (g, res) in live.iter().zip(results) {
+            let (plays, status) = match res {
+                Ok(r) => r,
+                Err(e) => { tracing::warn!(pk = g.0, %e, "gumbo poll failed"); continue; }
             };
-            let last = seen.entry(*pk).or_insert(-1);
-            for p in plays.iter().filter(|p| p.at_bat_index > *last) {
-                if entry_events.iter().any(|e| e == &p.event_type) {
-                    let ticker = if p.half == "top" { away_t } else { home_t };
-                    if !ticker.is_empty() {
-                        tx.send(Tick::Signal {
-                            ticker: ticker.clone(),
-                            event: p.event_type.clone(),
-                            detail: format!("inn{} {} {}-{}", p.inning, p.half,
-                                            p.away_score, p.home_score),
-                        }).await.ok();
-                    }
-                }
+            let last = seen.entry(g.0).or_insert(-1);
+            if let Some(p) = plays.iter().filter(|p| p.at_bat_index > *last).last() {
                 *last = p.at_bat_index;
+                send_fair(p, g, tx.clone()).await;
+            }
+            if status == "Final" {
+                done.insert(g.0, true);
+                if let Some(p) = plays.last() {
+                    let home_won = p.home_score > p.away_score;
+                    for (t, won) in [(&g.4, home_won), (&g.3, !home_won)] {
+                        if !t.is_empty() {
+                            tx.send(Tick::Settle { ticker: t.clone(), won }).await.ok();
+                        }
+                    }
+                    tracing::info!(pk = g.0, home_won, "game final -> settle");
+                }
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -251,7 +357,13 @@ async fn main() -> Result<()> {
 
     // ---- discover today's games & their ML market tickers (public REST)
     let kalshi = KalshiClient::new(8)?;
-    let today = Utc::now().format("%Y-%m-%d").to_string();
+    // "Today" in US/Eastern terms: MLB slates run past midnight UTC, so anchor
+    // the date 8h behind UTC (flips ~4 AM ET, after the last West-coast final).
+    let today = (Utc::now() - ChronoDur::hours(8)).format("%Y-%m-%d").to_string();
+    // Kalshi event tickers embed the date as e.g. "26JUL09" — used to keep the
+    // join from matching a leftover open market from a previous day's game.
+    let date_code = (Utc::now() - ChronoDur::hours(8)).format("%y%b%d")
+        .to_string().to_uppercase();
     let mlb = MlbClient::new()?;
     let sched = mlb.schedule(&today).await?;
 
@@ -266,7 +378,8 @@ async fn main() -> Result<()> {
         let resp: EventsResp = kalshi.get_json(&url).await?;
         for ev in &resp.events {
             let et = ev["event_ticker"].as_str().unwrap_or("");
-            if let Some((_, away, home)) = common::parse_event_teams(et) {
+            if let Some((date, away, home)) = common::parse_event_teams(et) {
+                if date != date_code { continue; }
                 for m in ev["markets"].as_array().unwrap_or(&vec![]) {
                     let ticker = m["ticker"].as_str().unwrap_or("");
                     if let Some(side) = ticker.rsplit('-').next() {
@@ -301,21 +414,34 @@ async fn main() -> Result<()> {
             for t in [&away_ticker, &home_ticker] {
                 if !t.is_empty() { tickers.push(t.clone()); }
             }
-            games.push((*pk, away_ticker, home_ticker));
+            games.push((*pk, away.clone(), home.clone(), away_ticker, home_ticker));
         }
     }
     tracing::info!(n_games = games.len(), n_markets = tickers.len(), "watching");
     if games.is_empty() {
         return Err(anyhow!("no live MLB markets found for {today}"));
     }
+    let ratings = common::wp::Ratings::from_csv(&cfg.ratings_path)
+        .context("loading ratings.csv (regenerate with wp_model.py)")?;
 
-    // ---- log file
+    // ---- log file (archive any previous run so daily history accumulates)
+    if let Ok(meta) = std::fs::metadata(&cfg.log_path) {
+        if meta.len() > 0 {
+            let stamp: chrono::DateTime<Utc> = meta.modified()?.into();
+            let archived = format!("{}.{}.csv",
+                cfg.log_path.trim_end_matches(".csv"), stamp.format("%Y-%m-%d_%H%M%S"));
+            std::fs::rename(&cfg.log_path, &archived)?;
+            tracing::info!(%archived, "archived previous trade log");
+        }
+    }
     let mut log = csv::Writer::from_path(&cfg.log_path)?;
     log.write_record([
-        "signal_time", "ticker", "event", "detail", "entry_price", "entry_filled_at",
-        "entry_filled_at_optimistic", "exit_price", "exit_mode", "pnl_cents_conservative",
-        "pnl_cents_optimistic", "fees",
+        "ts", "ticker", "action", "price_cents", "size", "fair_model_cents",
+        "fair_blend_cents", "detail", "pnl_cents", "fees",
     ])?;
+    log.flush()?;
+    let mut adapt = Adapt::load("adapt_state.json", cfg.entry_edge_cents);
+    tracing::info!(threshold = adapt.threshold, "adaptive entry threshold loaded");
 
     // ---- spin up tasks
     let (tx, mut rx) = mpsc::channel::<Tick>(4096);
@@ -323,126 +449,266 @@ async fn main() -> Result<()> {
         let tx = tx.clone();
         let tickers = tickers.clone();
         async move {
-            if let Err(e) = ws_task(signer, tickers, tx).await {
-                tracing::error!(%e, "ws task died");
+            loop {
+                if let Err(e) = ws_task(signer.clone(), tickers.clone(), tx.clone()).await {
+                    tracing::warn!(%e, "ws task died; reconnecting in 5s");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         }
     });
-    tokio::spawn(gumbo_task(games, cfg.entry_events.clone(), tx.clone()));
+    tokio::spawn(gumbo_task(games, ratings, tx.clone()));
 
     let mut books: HashMap<String, Book> = HashMap::new();
-    let mut open_entries: Vec<SimOrder> = Vec::new();
-    let mut positions: Vec<(SimOrder, chrono::DateTime<Utc>)> = Vec::new(); // filled entry, fill time
-    let mut open_exits: Vec<(SimOrder, SimOrder)> = Vec::new(); // (entry, exit order)
+    let mut positions: HashMap<String, Pos> = HashMap::new();
+    // feed-health telemetry: what the loop actually receives, logged each minute
+    let (mut n_snap, mut n_delta, mut n_trade) = (0u64, 0u64, 0u64);
+    let mut last_stats = Utc::now();
 
     while let Some(tick) = rx.recv().await {
         let now = Utc::now();
-        match tick {
+        if (now - last_stats).num_seconds() >= 60 {
+            let sample = books.iter()
+                .find_map(|(t, b)| Some((t, b.best_bid()?, b.best_ask()?)));
+            tracing::info!(n_snap, n_delta, n_trade, ?sample, "feed stats (last 60s)");
+            (n_snap, n_delta, n_trade) = (0, 0, 0);
+            last_stats = now;
+        }
+        // which market to re-evaluate after applying this tick
+        let touched: Option<String> = match tick {
             Tick::Snapshot(t, yes, no) => {
-                books.entry(t).or_default().set_snapshot(&yes, &no);
+                n_snap += 1;
+                books.entry(t.clone()).or_default().set_snapshot(&yes, &no);
+                Some(t)
             }
             Tick::Delta(t, side, price, delta) => {
-                books.entry(t).or_default().apply(&side, price, delta);
+                n_delta += 1;
+                books.entry(t.clone()).or_default().apply(&side, price, delta);
+                Some(t)
             }
             Tick::Trade(t, price, count, _taker) => {
+                n_trade += 1;
                 // advance queues: sells print at/below our bid; buys at/above our ask
-                for o in open_entries.iter_mut().chain(open_exits.iter_mut().map(|(_, e)| e)) {
-                    if o.ticker != t || o.state != OrderState::Resting { continue; }
-                    let crosses = if o.is_buy { price <= o.price } else { price >= o.price };
-                    if crosses {
-                        o.first_print_at.get_or_insert(now);
-                        o.filled_volume += count;
-                        if o.filled_volume >= o.queue_ahead + o.size {
-                            o.state = OrderState::Filled;
+                if let Some(pos) = positions.get_mut(&t) {
+                    for o in [pos.entry.as_mut(), pos.exit.as_mut()].into_iter().flatten() {
+                        if o.state != OrderState::Resting { continue; }
+                        let crosses = if o.is_buy { price <= o.price } else { price >= o.price };
+                        if crosses {
+                            o.first_print_at.get_or_insert(now);
+                            o.filled_volume += count;
+                            let through = if o.is_buy { price < o.price } else { price > o.price };
+                            if through || o.filled_volume >= o.queue_ahead + o.size {
+                                o.state = OrderState::Filled;
+                            }
                         }
                     }
                 }
+                Some(t)
             }
-            Tick::Signal { ticker, event, detail } => {
-                let Some(book) = books.get(&ticker) else { continue };
-                let (Some((bid, bid_sz)), Some((ask, _))) = (book.best_bid(), book.best_ask())
-                    else { continue };
-                if ask - bid > cfg.max_spread_cents || bid < 5 || bid > 95 {
-                    continue; // too wide or too close to settled
+            Tick::Fair { ticker, fair_c, detail } => {
+                let pos = positions.entry(ticker.clone()).or_default();
+                pos.fair_c = Some(fair_c);
+                pos.detail = detail;
+                pos.fair_seq += 1;
+                Some(ticker)
+            }
+            Tick::Settle { ticker, won } => {
+                if let Some(pos) = positions.get_mut(&ticker) {
+                    let qty: f64 = pos.clips.iter().map(|c| c.1).sum();
+                    if qty > 0.0 {
+                        let px = if won { 100i64 } else { 0i64 };
+                        let cost: f64 = pos.clips.iter()
+                            .map(|(p, s)| *p as f64 * s).sum();
+                        let pnl = px as f64 * qty - cost;
+                        pos.realized += pnl;
+                        adapt.record(pnl);
+                        log.write_record([
+                            now.to_rfc3339(), ticker.clone(), "settle".into(),
+                            px.to_string(), format!("{qty}"),
+                            format!("{:.1}", pos.fair_c.unwrap_or_default()),
+                            String::new(),
+                            pos.detail.clone(), format!("{pnl:.1}"), "0.00".into(),
+                        ])?;
+                        log.flush()?;
+                        tracing::info!(%ticker, won, pnl_cents = pnl, "settled at game end");
+                    }
+                    pos.clips.clear();
+                    pos.entry = None;
+                    pos.exit = None;
+                    pos.fair_c = None; // no more trading this market
                 }
-                tracing::info!(%ticker, %event, %detail, bid, ask, "SIGNAL -> join bid");
-                open_entries.push(SimOrder {
-                    ticker, is_buy: true, price: bid, size: cfg.size,
-                    queue_ahead: bid_sz, filled_volume: 0.0, placed_at: now,
-                    first_print_at: None, state: OrderState::Resting,
-                });
-                // stash signal context in the log row when the round trip closes
-                let _ = (&event, &detail);
+                None
             }
+        };
+
+        // ---- evaluate the touched market: fills, then entry/exit decisions
+        let Some(t) = touched else { continue };
+        let Some(pos) = positions.get_mut(&t) else { continue };
+
+        let Some(book) = books.get(&t) else { continue };
+        let (Some((bid, bid_sz)), Some((ask, ask_sz))) = (book.best_bid(), book.best_ask())
+            else { continue };
+        let fair_model = pos.fair_c;
+        // Decisions use a model/market blend: the model only updates on
+        // completed plays, so raw model-vs-book gaps can be the market knowing
+        // something first. The blend (best Brier in backtest) halves phantom
+        // edges while keeping real ones tradeable.
+        let mid = (bid + ask) as f64 / 2.0;
+        let fair_blend = fair_model.map(|f| BLEND_W * f + (1.0 - BLEND_W) * mid);
+
+        // realize fills
+        if pos.entry.as_ref().is_some_and(|o| o.state == OrderState::Filled) {
+            let o = pos.entry.take().unwrap();
+            pos.clips.push((o.price, o.size));
+            pos.last_fill_seq = pos.fair_seq;
+            log.write_record([
+                now.to_rfc3339(), t.clone(),
+                if pos.clips.len() > 1 { "add".into() } else { "entry".to_string() },
+                o.price.to_string(), format!("{}", o.size),
+                format!("{:.1}", fair_model.unwrap_or_default()),
+                format!("{:.1}", fair_blend.unwrap_or_default()),
+                pos.detail.clone(), String::new(), "0.00".into(),
+            ])?;
+            log.flush()?;
+            tracing::info!(ticker = %t, price = o.price, clips = pos.clips.len(),
+                           fair = fair_model.unwrap_or_default(), "entry filled");
+        }
+        if pos.exit.as_ref().is_some_and(|o| o.state == OrderState::Filled) {
+            let o = pos.exit.take().unwrap();
+            let cost: f64 = pos.clips.iter().map(|(p, s)| *p as f64 * s).sum();
+            let qty: f64 = pos.clips.iter().map(|c| c.1).sum();
+            let pnl = o.price as f64 * qty - cost;
+            pos.clips.clear();
+            pos.realized += pnl;
+            adapt.record(pnl);
+            log.write_record([
+                now.to_rfc3339(), t.clone(), "exit_maker".into(),
+                o.price.to_string(), format!("{qty}"),
+                format!("{:.1}", fair_model.unwrap_or_default()),
+                format!("{:.1}", fair_blend.unwrap_or_default()),
+                pos.detail.clone(), format!("{pnl:.1}"), "0.00".into(),
+            ])?;
+            log.flush()?;
+            tracing::info!(ticker = %t, exit = o.price, pnl_cents = pnl,
+                           "position closed (maker)");
         }
 
-        // ---- lifecycle: entries that filled -> positions; hold; exits
-        let mut i = 0;
-        while i < open_entries.len() {
-            match open_entries[i].state {
-                OrderState::Filled => {
-                    let o = open_entries.remove(i);
-                    tracing::info!(ticker = %o.ticker, price = o.price, "entry filled");
-                    positions.push((o, now));
-                }
-                OrderState::Resting
-                    if (now - open_entries[i].placed_at).num_seconds() > 90 =>
-                {
-                    // never filled inside the reaction window -> cancel
-                    open_entries.remove(i);
-                }
-                _ => i += 1,
+        let (Some(_), Some(fair)) = (fair_model, fair_blend) else { continue };
+        let qty: f64 = pos.clips.iter().map(|c| c.1).sum();
+
+        // cancel stale resting orders when the blended view has moved
+        if pos.entry.as_ref().is_some_and(|o| fair - o.price as f64 <= cfg.exit_edge_cents) {
+            pos.entry = None;
+        }
+        if pos.exit.as_ref().is_some_and(|o| (o.price as f64) < fair) {
+            pos.exit = None;
+        }
+
+        // entry / averaging down, gated on:
+        //  - blended edge >= adaptive threshold
+        //  - adds only after a NEW play re-confirmed the edge (fair_seq moved)
+        //  - per-market daily loss stop
+        let fresh_confirmation = pos.clips.is_empty() || pos.fair_seq > pos.last_fill_seq;
+        if pos.entry.is_none() && pos.exit.is_none()
+            && pos.clips.len() < cfg.max_clips
+            && fresh_confirmation
+            && pos.realized > MARKET_LOSS_STOP_C
+            && fair - bid as f64 >= adapt.threshold
+            && ask - bid <= cfg.max_spread_cents
+            && bid >= 5 && ask <= 95
+        {
+            tracing::info!(ticker = %t, bid, ask, fair = format!("{fair:.1}"),
+                           model = format!("{:.1}", fair_model.unwrap_or_default()),
+                           thr = adapt.threshold, detail = %pos.detail,
+                           clips = pos.clips.len(), "EDGE -> join bid");
+            pos.entry = Some(SimOrder {
+                ticker: t.clone(), is_buy: true, price: bid, size: cfg.size,
+                queue_ahead: bid_sz, filled_volume: 0.0, placed_at: now,
+                first_print_at: None, state: OrderState::Resting,
+            });
+        }
+
+        if qty > 0.0 {
+            // taker dump: blended view flipped hard against us; pay the fee
+            let fee = taker_fee(qty, bid);
+            if (bid as f64 - fair) - fee * 100.0 / qty.max(1.0) >= adapt.threshold {
+                let cost: f64 = pos.clips.iter().map(|(p, s)| *p as f64 * s).sum();
+                let pnl = bid as f64 * qty - cost - fee * 100.0;
+                pos.clips.clear();
+                pos.exit = None;
+                pos.realized += pnl;
+                adapt.record(pnl);
+                log.write_record([
+                    now.to_rfc3339(), t.clone(), "exit_taker".into(),
+                    bid.to_string(), format!("{qty}"),
+                    format!("{:.1}", fair_model.unwrap_or_default()),
+                    format!("{fair:.1}"), pos.detail.clone(),
+                    format!("{pnl:.1}"), format!("{fee:.2}"),
+                ])?;
+                log.flush()?;
+                tracing::info!(ticker = %t, exit = bid, pnl_cents = pnl,
+                               "position dumped (taker, model flipped)");
+            } else if pos.exit.is_none() && ask as f64 >= fair + cfg.exit_edge_cents {
+                // maker exit: the ask is now above blended fair -> sell into it
+                pos.exit = Some(SimOrder {
+                    ticker: t.clone(), is_buy: false, price: ask, size: qty,
+                    queue_ahead: ask_sz, filled_volume: 0.0, placed_at: now,
+                    first_print_at: None, state: OrderState::Resting,
+                });
             }
-        }
-        let mut i = 0;
-        while i < positions.len() {
-            if (now - positions[i].1).num_minutes() >= cfg.hold_minutes {
-                let (entry, _) = positions.remove(i);
-                let book = books.get(&entry.ticker);
-                let (ask, ask_sz) = book.and_then(|b| b.best_ask()).unwrap_or((99, 0.0));
-                open_exits.push((entry, SimOrder {
-                    ticker: String::new(), // filled from entry on log
-                    is_buy: false, price: ask, size: cfg.size, queue_ahead: ask_sz,
-                    filled_volume: 0.0, placed_at: now, first_print_at: None,
-                    state: OrderState::Resting,
-                }));
-                let n = open_exits.len() - 1;
-                open_exits[n].1.ticker = open_exits[n].0.ticker.clone();
-            } else { i += 1; }
-        }
-        let mut i = 0;
-        while i < open_exits.len() {
-            let done = {
-                let (entry, exit) = &mut open_exits[i];
-                let timed_out = (now - exit.placed_at).num_seconds() > cfg.exit_timeout_s;
-                if exit.state == OrderState::Filled || timed_out {
-                    // conservative: maker exit at exit.price if filled, else cross at bid + fee
-                    let (exit_px, mode, fee) = if exit.state == OrderState::Filled {
-                        (exit.price, "maker", 0.0)
-                    } else {
-                        let bid = books.get(&entry.ticker)
-                            .and_then(|b| b.best_bid()).map(|(p, _)| p).unwrap_or(1);
-                        (bid, "taker", taker_fee(exit.size, bid))
-                    };
-                    let pnl_c = (exit_px - entry.price) as f64 * entry.size
-                        - fee * 100.0;
-                    let pnl_opt = pnl_c; // same round trip; optimistic differs on entry time only
-                    log.write_record([
-                        entry.placed_at.to_rfc3339(), entry.ticker.clone(), "", "",
-                        entry.price.to_string(),
-                        entry.first_print_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
-                        entry.first_print_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
-                        exit_px.to_string(), mode.into(),
-                        format!("{pnl_c:.1}"), format!("{pnl_opt:.1}"), format!("{fee:.2}"),
-                    ])?;
-                    log.flush()?;
-                    tracing::info!(ticker = %entry.ticker, entry = entry.price, exit = exit_px,
-                                   mode, pnl_cents = pnl_c, "round trip closed");
-                    true
-                } else { false }
-            };
-            if done { open_exits.remove(i); } else { i += 1; }
         }
     }
     Ok(())
+}
+
+/// Per-market strategy state.
+#[derive(Default)]
+struct Pos {
+    /// latest model fair value (cents); None once settled
+    fair_c: Option<f64>,
+    detail: String,
+    /// filled clips: (price cents, contracts)
+    clips: Vec<(i64, f64)>,
+    entry: Option<SimOrder>,
+    exit: Option<SimOrder>,
+    /// bumped on every Fair tick (new completed play)
+    fair_seq: u64,
+    /// fair_seq at the last clip fill; adds require a newer play to confirm
+    last_fill_seq: u64,
+    /// realized P&L today (cents) — entries stop at MARKET_LOSS_STOP_C
+    realized: f64,
+}
+
+/// Self-tuning entry threshold: tightens after losses, relaxes after wins.
+struct Adapt {
+    threshold: f64,
+    recent: std::collections::VecDeque<f64>,
+    path: String,
+}
+
+impl Adapt {
+    fn load(path: &str, default_thr: f64) -> Self {
+        let threshold = std::fs::read_to_string(path).ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v["threshold"].as_f64())
+            .unwrap_or(default_thr)
+            .clamp(THR_MIN, THR_MAX);
+        Self { threshold, recent: Default::default(), path: path.into() }
+    }
+    fn record(&mut self, pnl_cents: f64) {
+        self.recent.push_back(pnl_cents);
+        if self.recent.len() > THR_WINDOW { self.recent.pop_front(); }
+        if self.recent.len() == THR_WINDOW {
+            let net: f64 = self.recent.iter().sum();
+            let old = self.threshold;
+            self.threshold = (self.threshold + if net < 0.0 { 1.0 } else { -1.0 })
+                .clamp(THR_MIN, THR_MAX);
+            if (self.threshold - old).abs() > f64::EPSILON {
+                tracing::info!(net_last5 = net, threshold = self.threshold,
+                               "adaptive entry threshold updated");
+                std::fs::write(&self.path, format!(
+                    "{{\"threshold\": {:.1}}}", self.threshold)).ok();
+            }
+        }
+    }
 }
