@@ -170,6 +170,8 @@ enum Tick {
     Fair { ticker: String, fair_c: f64, detail: String },
     /// game ended; `won` = this market's team won
     Settle { ticker: String, won: bool },
+    /// every game on the slate is final — the day is done
+    AllFinal,
 }
 
 // ---------------------------------------------------------------- ws task
@@ -314,7 +316,8 @@ async fn gumbo_task(
         let live: Vec<&Game> = games.iter()
             .filter(|g| !done.get(&g.0).copied().unwrap_or(false)).collect();
         if live.is_empty() {
-            tracing::info!("all games final; gumbo task idle");
+            tracing::info!("all games final; ending day");
+            tx.send(Tick::AllFinal).await.ok();
             return Ok(());
         }
         let results = futures_util::future::join_all(polls).await;
@@ -354,9 +357,35 @@ async fn main() -> Result<()> {
     let cfg: Config = toml::from_str(&std::fs::read_to_string(&args.config)?)
         .context("parsing config.toml")?;
     let signer = Signer::from_pem_file(&cfg.key_id, &cfg.private_key_path)?;
-
-    // ---- discover today's games & their ML market tickers (public REST)
     let kalshi = KalshiClient::new(8)?;
+    let mlb = MlbClient::new()?;
+    let ratings = common::wp::Ratings::from_csv(&cfg.ratings_path)
+        .context("loading ratings.csv (regenerate with wp_model.py)")?;
+
+    // Self-rolling day loop: trade a slate until every game is final, then
+    // rediscover. Off days (e.g. the All-Star break) just retry until the
+    // next slate appears — no external daily restart needed.
+    loop {
+        match run_day(&cfg, &signer, &kalshi, &mlb, &ratings).await {
+            Ok(true) => tracing::info!("slate complete; rolling to next day"),
+            Ok(false) => {
+                tracing::info!("no open MLB markets; retrying in 30 min");
+                tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
+            }
+            Err(e) => {
+                tracing::warn!(%e, "day loop error; retrying in 5 min");
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            }
+        }
+    }
+}
+
+/// One slate: discover -> trade -> return Ok(true) when all games settle.
+/// Ok(false) = nothing to trade today (off day / slate already settled).
+async fn run_day(
+    cfg: &Config, signer: &Signer, kalshi: &KalshiClient, mlb: &MlbClient,
+    ratings: &common::wp::Ratings,
+) -> Result<bool> {
     // "Today" in US/Eastern terms: MLB slates run past midnight UTC, so anchor
     // the date 8h behind UTC (flips ~4 AM ET, after the last West-coast final).
     let today = (Utc::now() - ChronoDur::hours(8)).format("%Y-%m-%d").to_string();
@@ -364,7 +393,6 @@ async fn main() -> Result<()> {
     // join from matching a leftover open market from a previous day's game.
     let date_code = (Utc::now() - ChronoDur::hours(8)).format("%y%b%d")
         .to_string().to_uppercase();
-    let mlb = MlbClient::new()?;
     let sched = mlb.schedule(&today).await?;
 
     #[derive(Deserialize)]
@@ -419,10 +447,8 @@ async fn main() -> Result<()> {
     }
     tracing::info!(n_games = games.len(), n_markets = tickers.len(), "watching");
     if games.is_empty() {
-        return Err(anyhow!("no live MLB markets found for {today}"));
+        return Ok(false);
     }
-    let ratings = common::wp::Ratings::from_csv(&cfg.ratings_path)
-        .context("loading ratings.csv (regenerate with wp_model.py)")?;
 
     // ---- log file (archive any previous run so daily history accumulates)
     if let Ok(meta) = std::fs::metadata(&cfg.log_path) {
@@ -443,11 +469,12 @@ async fn main() -> Result<()> {
     let mut adapt = Adapt::load("adapt_state.json", cfg.entry_edge_cents);
     tracing::info!(threshold = adapt.threshold, "adaptive entry threshold loaded");
 
-    // ---- spin up tasks
+    // ---- spin up tasks (aborted when the slate completes)
     let (tx, mut rx) = mpsc::channel::<Tick>(4096);
-    tokio::spawn({
+    let ws_handle = tokio::spawn({
         let tx = tx.clone();
         let tickers = tickers.clone();
+        let signer = signer.clone();
         async move {
             loop {
                 if let Err(e) = ws_task(signer.clone(), tickers.clone(), tx.clone()).await {
@@ -457,7 +484,7 @@ async fn main() -> Result<()> {
             }
         }
     });
-    tokio::spawn(gumbo_task(games, ratings, tx.clone()));
+    let gumbo_handle = tokio::spawn(gumbo_task(games, ratings.clone(), tx.clone()));
 
     let mut books: HashMap<String, Book> = HashMap::new();
     let mut positions: HashMap<String, Pos> = HashMap::new();
@@ -542,6 +569,7 @@ async fn main() -> Result<()> {
                 }
                 None
             }
+            Tick::AllFinal => break,
         };
 
         // ---- evaluate the touched market: fills, then entry/exit decisions
@@ -668,7 +696,9 @@ async fn main() -> Result<()> {
             }
         }
     }
-    Ok(())
+    ws_handle.abort();
+    gumbo_handle.abort();
+    Ok(true)
 }
 
 /// Per-market strategy state.
