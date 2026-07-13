@@ -16,3 +16,4 @@ oos_preds.csv
 # runtime artifacts
 paper_trader_live.log
 adapt_state.json
+tracker.log
