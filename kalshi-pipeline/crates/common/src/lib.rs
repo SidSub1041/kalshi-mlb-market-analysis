@@ -549,6 +549,7 @@ pub mod wp {
     }
 
     /// team -> (offense, defense) rating, 1.0 = league average.
+    #[derive(Clone)]
     pub struct Ratings(HashMap<String, (f64, f64)>);
 
     impl Ratings {
