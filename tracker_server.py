@@ -1,9 +1,9 @@
 """Live paper-trading tracker. Serves a self-refreshing dashboard on :8787.
 
 Reads every v2-schema paper_trades*.csv in kalshi-pipeline/ (live file +
-archives), reconstructs positions, and renders the same layout as
-paper_run_final.xlsx: KPI cards, trade log with win/loss coloring, cumulative
-P&L. The page polls /data.json every 5 s.
+archives), reconstructs positions, and renders the xlsx-style layout with
+period tabs (Today / 1W / 1M / YTD / All) and a per-day performance table.
+The page polls /data.json every 5 s; all filtering happens client-side.
 
 Run: python3 tracker_server.py
 """
@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PIPE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'kalshi-pipeline')
 PORT = 8787
+ET_OFFSET_H = 4   # UTC -> ET (EDT)
 
 NAMES = {'ATH':'Athletics','ATL':'Braves','AZ':'D-backs','BAL':'Orioles','BOS':'Red Sox',
          'CHC':'Cubs','CIN':'Reds','CLE':'Guardians','COL':'Rockies','CWS':'White Sox',
@@ -24,13 +25,13 @@ NAMES = {'ATH':'Athletics','ATL':'Braves','AZ':'D-backs','BAL':'Orioles','BOS':'
 def parse_ticker(t):
     m = re.match(r'KXMLBGAME-(\d{2}[A-Z]{3}\d{2})\d{4}([A-Z]+)-([A-Z]+)$', t)
     if not m:
-        return t, '', ''
-    date, teams, side = m.groups()
+        return t, ''
+    _, teams, side = m.groups()
     for s in (2, 3):
         a, h = teams[:s], teams[s:]
         if a in NAMES and h in NAMES:
-            return f"{NAMES[a]} @ {NAMES[h]}", NAMES.get(side, side), date.title()
-    return t, NAMES.get(side, side), date.title()
+            return f"{NAMES[a]} @ {NAMES[h]}", NAMES.get(side, side)
+    return t, NAMES.get(side, side)
 
 def load_rows():
     rows = []
@@ -46,7 +47,6 @@ def load_rows():
     return rows
 
 def build():
-    """closed trades (xlsx trade-log format), open positions, KPIs."""
     open_clips, closed, opens = {}, [], []
     for r in load_rows():
         t = r['ticker']
@@ -62,10 +62,11 @@ def build():
             cost = sum(p * s for _, p, s, _ in clips)
             qty = sum(s for _, _, s, _ in clips)
             pnl = float(r['pnl_cents'] or 0)
-            game, team, date = parse_ticker(t)
+            game, team = parse_ticker(t)
             et = (datetime.fromisoformat(clips[0][0].replace('Z', '+00:00'))
-                  - timedelta(hours=4))
+                  - timedelta(hours=ET_OFFSET_H))
             closed.append({
+                'date_iso': et.strftime('%Y-%m-%d'),
                 'date': et.strftime('%b %d'), 'time': et.strftime('%I:%M %p'),
                 'game': game, 'team': team, 'state': clips[0][3],
                 'clips': len(clips), 'qty': qty,
@@ -77,39 +78,17 @@ def build():
             })
     now = datetime.now().astimezone()
     for t, clips in open_clips.items():
-        game, team, _ = parse_ticker(t)
+        game, team = parse_ticker(t)
         cost = sum(p * s for _, p, s, _ in clips)
         qty = sum(s for _, _, s, _ in clips)
         last_ts = datetime.fromisoformat(clips[-1][0].replace('Z', '+00:00'))
-        # entries with no close for >4h were orphaned by a trader restart;
-        # the live process no longer holds them
         stale = (now - last_ts).total_seconds() > 4 * 3600
         opens.append({'game': game, 'team': team, 'clips': len(clips), 'qty': qty,
                       'avg_entry': round(cost / qty, 1) if qty else 0,
                       'invested': round(cost / 100, 2),
                       'state': clips[-1][3] + (' — orphaned (restart)' if stale else '')})
-    pnls = [c['pnl'] for c in closed]
-    wins = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p < 0]
-    total_cost = sum(c['invested'] for c in closed)
-    kpis = {
-        'total_pnl': round(sum(pnls) / 100, 2),
-        'deployed': round(total_cost, 2),
-        'ret_on_deployed': round(sum(pnls) / total_cost, 1) if total_cost else 0,
-        'trades': len(closed), 'wins': len(wins), 'losses': len(losses),
-        'win_rate': round(100 * len(wins) / len(closed), 1) if closed else 0,
-        'avg_win': round(sum(wins) / len(wins) / 100, 2) if wins else 0,
-        'avg_loss': round(sum(losses) / len(losses) / 100, 2) if losses else 0,
-        'profit_factor': round(sum(wins) / abs(sum(losses)), 2) if losses else 0,
-        'fees': round(sum(c['fees'] for c in closed), 2),
-        'best': round(max(pnls) / 100, 2) if pnls else 0,
-        'worst': round(min(pnls) / 100, 2) if pnls else 0,
-    }
-    cum, acc = [], 0.0
-    for c in closed:
-        acc += c['pnl'] / 100
-        cum.append(round(acc, 2))
-    return {'kpis': kpis, 'closed': closed, 'open': opens, 'cum': cum,
+    today_iso = (datetime.utcnow() - timedelta(hours=ET_OFFSET_H)).strftime('%Y-%m-%d')
+    return {'closed': closed, 'open': opens, 'today_iso': today_iso,
             'updated': datetime.now().strftime('%I:%M:%S %p')}
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
@@ -119,6 +98,10 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .title{background:#1F3864;color:#fff;text-align:center;font-size:22px;
         font-weight:bold;padding:14px}
  .sub{color:#404040;font-style:italic;text-align:center;font-size:12px;margin:8px 20px}
+ .tabs{display:flex;justify-content:center;gap:4px;margin:12px}
+ .tab{padding:7px 20px;border:1px solid #1F3864;color:#1F3864;cursor:pointer;
+      font-weight:bold;font-size:13px;border-radius:3px}
+ .tab.on{background:#1F3864;color:#fff}
  .kpis{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin:14px}
  .kpi{min-width:96px;text-align:center;border:1px solid #BFBFBF}
  .kpi .h{background:#44546A;color:#fff;font-size:11px;font-weight:bold;padding:5px}
@@ -132,45 +115,94 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
  td.loss{background:#FFC7CE;color:#9C0006;font-weight:bold}
  .sec{color:#1F3864;font-weight:bold;font-size:15px;margin:18px 0 4px;text-align:center}
  .upd{color:#888;font-size:11px;text-align:center;margin:10px}
+ .note{color:#888;font-size:11px;text-align:center}
  svg{display:block;margin:6px auto}
 </style></head><body>
 <div class="title">KALSHI MLB PAPER-TRADING RESULTS — LIVE</div>
 <div class="sub">Fair-value model (v2). Simulated money. Auto-refreshes every 5 seconds
  from the trader's live CSV logs.</div>
+<div class="tabs" id="tabs"></div>
 <div class="kpis" id="kpis"></div>
-<div class="sec">Cumulative P&amp;L ($)</div><svg id="chart" width="640" height="150"></svg>
+<div class="sec">Cumulative P&amp;L ($) — <span id="chartlbl"></span></div>
+<svg id="chart" width="640" height="150"></svg>
+<div class="sec">Performance by Day (all history)</div><table id="days"></table>
+<div class="note">Judge the model day by day — early days ran older builds
+ (see the Jul 11 Rockies outlier).</div>
 <div class="sec">Open Positions</div><table id="open"></table>
-<div class="sec">Closed Trades</div><table id="log"></table>
+<div class="sec">Closed Trades — <span id="loglbl"></span></div><table id="log"></table>
 <div class="upd" id="upd"></div>
 <script>
 const $=id=>document.getElementById(id);
 const money=v=>(v<0?'-$':'$')+Math.abs(v).toFixed(2);
+const PERIODS=['Today','1W','1M','YTD','All'];
+let period=localStorage.getItem('kt_period')||'Today';
+let last=null;
+
+function inPeriod(d,today){
+ if(period==='All')return true;
+ if(period==='Today')return d===today;
+ const days={'1W':7,'1M':30}[period];
+ if(days){
+  const lim=new Date(today);lim.setDate(lim.getDate()-days+1);
+  return d>=lim.toISOString().slice(0,10);
+ }
+ return d.slice(0,4)===today.slice(0,4);   // YTD
+}
+function stats(rows){
+ const pnls=rows.map(c=>c.pnl),wins=pnls.filter(p=>p>0),losses=pnls.filter(p=>p<0);
+ const cost=rows.reduce((a,c)=>a+c.invested,0),tot=pnls.reduce((a,b)=>a+b,0);
+ return {pnl:tot/100,cost,ret:cost?100*tot/100/cost:0,n:rows.length,
+  w:wins.length,l:losses.length,
+  wr:rows.length?100*wins.length/rows.length:0,
+  aw:wins.length?wins.reduce((a,b)=>a+b,0)/wins.length/100:0,
+  al:losses.length?losses.reduce((a,b)=>a+b,0)/losses.length/100:0,
+  pf:losses.length?wins.reduce((a,b)=>a+b,0)/Math.abs(losses.reduce((a,b)=>a+b,0)):0,
+  fees:rows.reduce((a,c)=>a+c.fees,0),
+  best:pnls.length?Math.max(...pnls)/100:0,worst:pnls.length?Math.min(...pnls)/100:0};
+}
 function kpi(h,v,cls){return `<div class="kpi"><div class="h">${h}</div>`+
-  `<div class="v ${cls||''}">${v}</div></div>`}
-async function tick(){
- let d;
- try{d=await (await fetch('/data.json',{cache:'no-store'})).json()}catch(e){return}
- const k=d.kpis;
+ `<div class="v ${cls||''}">${v}</div></div>`}
+function render(){
+ if(!last)return;
+ const d=last,today=d.today_iso;
+ $('tabs').innerHTML=PERIODS.map(p=>
+  `<div class="tab ${p===period?'on':''}" onclick="setP('${p}')">${p}</div>`).join('');
+ const rows=d.closed.filter(c=>inPeriod(c.date_iso,today));
+ const k=stats(rows);
  $('kpis').innerHTML=
-  kpi('Total P&L',money(k.total_pnl),k.total_pnl>=0?'good':'bad')+
-  kpi('Deployed',money(k.deployed))+
-  kpi('Return',k.ret_on_deployed+'%',k.ret_on_deployed>=0?'good':'bad')+
-  kpi('Trades',k.trades+` (${k.wins}W/${k.losses}L)`)+
-  kpi('Win Rate',k.win_rate+'%')+
-  kpi('Avg Win',money(k.avg_win),'good')+
-  kpi('Avg Loss',money(k.avg_loss),'bad')+
-  kpi('Profit Factor',k.profit_factor+'x')+
+  kpi('Total P&L',money(k.pnl),k.pnl>=0?'good':'bad')+
+  kpi('Deployed',money(k.cost))+
+  kpi('Return',k.ret.toFixed(1)+'%',k.ret>=0?'good':'bad')+
+  kpi('Trades',`${k.n} (${k.w}W/${k.l}L)`)+
+  kpi('Win Rate',k.wr.toFixed(0)+'%')+
+  kpi('Avg Win',money(k.aw),'good')+
+  kpi('Avg Loss',money(k.al),'bad')+
+  kpi('Profit Factor',k.pf.toFixed(2)+'x')+
   kpi('Fees',money(k.fees))+
   kpi('Best',money(k.best),'good')+
   kpi('Worst',money(k.worst),'bad');
- const svg=$('chart');
- if(d.cum.length>1){
-  const W=620,H=130,mn=Math.min(0,...d.cum),mx=Math.max(0,...d.cum);
-  const x=i=>10+i*(W-20)/(d.cum.length-1), y=v=>10+(mx-v)*(H-20)/((mx-mn)||1);
+ $('chartlbl').textContent=period;$('loglbl').textContent=period;
+ const svg=$('chart');let acc=0;const cum=rows.map(c=>(acc+=c.pnl/100,acc));
+ if(cum.length>1){
+  const W=620,H=130,mn=Math.min(0,...cum),mx=Math.max(0,...cum);
+  const x=i=>10+i*(W-20)/(cum.length-1),y=v=>10+(mx-v)*(H-20)/((mx-mn)||1);
   svg.innerHTML=`<line x1="10" y1="${y(0)}" x2="${W-10}" y2="${y(0)}"
-    stroke="#BFBFBF"/><polyline fill="none" stroke="#1F3864" stroke-width="2"
-    points="${d.cum.map((v,i)=>x(i)+','+y(v)).join(' ')}"/>`;
+   stroke="#BFBFBF"/><polyline fill="none" stroke="#1F3864" stroke-width="2"
+   points="${cum.map((v,i)=>x(i)+','+y(v)).join(' ')}"/>`;
  } else svg.innerHTML='';
+ const byday={};
+ d.closed.forEach(c=>{(byday[c.date_iso]=byday[c.date_iso]||[]).push(c)});
+ $('days').innerHTML=
+  '<tr><th>Day</th><th>Trades</th><th>W/L</th><th>Deployed</th><th>P&L</th>'+
+  '<th>Return</th><th>Win Rate</th><th>Worst Trade</th></tr>'+
+  Object.keys(byday).sort().reverse().map(day=>{
+   const s=stats(byday[day]);
+   const cls=s.pnl>0?'win':(s.pnl<0?'loss':'');
+   return `<tr><td>${day}${day===today?' (today)':''}</td><td>${s.n}</td>`+
+    `<td>${s.w}/${s.l}</td><td>${money(s.cost)}</td>`+
+    `<td class="${cls}">${money(s.pnl)}</td><td class="${cls}">${s.ret.toFixed(1)}%</td>`+
+    `<td>${s.wr.toFixed(0)}%</td><td>${money(s.worst)}</td></tr>`;
+  }).join('');
  $('open').innerHTML=d.open.length?
   '<tr><th>Game</th><th>Team</th><th>Clips</th><th>Contracts</th>'+
   '<th>Avg Entry ¢</th><th>Invested</th><th>Last State</th></tr>'+
@@ -178,11 +210,11 @@ async function tick(){
    `<td>${o.qty}</td><td>${o.avg_entry}</td><td>${money(o.invested)}</td>`+
    `<td>${o.state}</td></tr>`).join('')
   :'<tr><td>none</td></tr>';
- $('log').innerHTML=
+ $('log').innerHTML=rows.length?
   '<tr><th>#</th><th>Date</th><th>Time (ET)</th><th>Game</th><th>Team Bought</th>'+
   '<th>State at Entry</th><th>Clips</th><th>Avg Entry ¢</th><th>Exit ¢</th>'+
   '<th>Exit Type</th><th>Invested</th><th>P&L ¢</th><th>Return</th><th>Result</th></tr>'+
-  d.closed.map((c,i)=>{
+  rows.map((c,i)=>{
    const cls=c.pnl>0?'win':(c.pnl<0?'loss':'');
    return `<tr><td>${i+1}</td><td>${c.date}</td><td>${c.time}</td><td>${c.game}</td>`+
     `<td>${c.team}</td><td>${c.state}</td><td>${c.clips}</td><td>${c.avg_entry}</td>`+
@@ -190,8 +222,14 @@ async function tick(){
     `<td class="${cls}">${c.pnl>0?'+':''}${c.pnl}</td>`+
     `<td class="${cls}">${c.ret>0?'+':''}${c.ret}%</td>`+
     `<td class="${cls}">${c.pnl>0?'WIN':(c.pnl<0?'LOSS':'FLAT')}</td></tr>`;
-  }).join('');
+  }).join('')
+  :'<tr><td>no closed trades in this period</td></tr>';
  $('upd').textContent='Last updated '+d.updated;
+}
+function setP(p){period=p;localStorage.setItem('kt_period',p);render()}
+async function tick(){
+ try{last=await (await fetch('/data.json',{cache:'no-store'})).json()}catch(e){return}
+ render();
 }
 tick();setInterval(tick,5000);
 </script></body></html>"""
