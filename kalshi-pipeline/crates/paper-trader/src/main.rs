@@ -367,7 +367,14 @@ async fn main() -> Result<()> {
     // next slate appears — no external daily restart needed.
     loop {
         match run_day(&cfg, &signer, &kalshi, &mlb, &ratings).await {
-            Ok(true) => tracing::info!("slate complete; rolling to next day"),
+            Ok(true) => {
+                // Kalshi keeps settled markets "open" for a few minutes after
+                // the last out; rolling instantly re-discovers the finished
+                // slate in a tight loop. The next slate is hours away — cool
+                // off before looking again.
+                tracing::info!("slate complete; next discovery in 30 min");
+                tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
+            }
             Ok(false) => {
                 tracing::info!("no open MLB markets; retrying in 30 min");
                 tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
