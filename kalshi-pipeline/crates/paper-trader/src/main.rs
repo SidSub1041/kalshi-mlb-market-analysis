@@ -491,6 +491,11 @@ async fn run_day(
             }
         }
     });
+    // map each market to its opposite side so a game is never held both ways
+    let other_side: HashMap<String, String> = games.iter()
+        .flat_map(|g| [(g.3.clone(), g.4.clone()), (g.4.clone(), g.3.clone())])
+        .filter(|(a, b)| !a.is_empty() && !b.is_empty())
+        .collect();
     let gumbo_handle = tokio::spawn(gumbo_task(games, ratings.clone(), tx.clone()));
 
     let mut books: HashMap<String, Book> = HashMap::new();
@@ -542,6 +547,12 @@ async fn run_day(
             Tick::Fair { ticker, fair_c, detail } => {
                 let pos = positions.entry(ticker.clone()).or_default();
                 pos.fair_c = Some(fair_c);
+                // detail leads with "inn{N} ..." — track the inning for the
+                // late-game clip cap
+                pos.inning = detail.strip_prefix("inn")
+                    .and_then(|s| s.split_whitespace().next())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(pos.inning);
                 pos.detail = detail;
                 pos.fair_seq += 1;
                 Some(ticker)
@@ -581,6 +592,12 @@ async fn run_day(
 
         // ---- evaluate the touched market: fills, then entry/exit decisions
         let Some(t) = touched else { continue };
+        // one side per game: block entries while the opposite market has any
+        // position or resting entry (holding both sides, then exiting one, is
+        // how the Jul 17 SD/KC incoherence happened)
+        let other_blocked = other_side.get(&t)
+            .and_then(|o| positions.get(o))
+            .is_some_and(|op| !op.clips.is_empty() || op.entry.is_some());
         let Some(pos) = positions.get_mut(&t) else { continue };
 
         let Some(book) = books.get(&t) else { continue };
@@ -652,7 +669,12 @@ async fn run_day(
         //  - adds only after a NEW play re-confirmed the edge (fair_seq moved)
         //  - per-market daily loss stop
         let fresh_confirmation = pos.clips.is_empty() || pos.fair_seq > pos.last_fill_seq;
+        // from inning 7 on, cap the market at a single clip: late-game edges
+        // backtest best but settle binary — bound the tail
+        let late_capped = pos.inning >= 7 && !pos.clips.is_empty();
         if pos.entry.is_none() && pos.exit.is_none()
+            && !other_blocked
+            && !late_capped
             && pos.clips.len() < cfg.max_clips
             && fresh_confirmation
             && pos.realized > MARKET_LOSS_STOP_C
@@ -718,6 +740,8 @@ struct Pos {
     clips: Vec<(i64, f64)>,
     entry: Option<SimOrder>,
     exit: Option<SimOrder>,
+    /// current inning per the last Fair tick (for the late-game clip cap)
+    inning: i64,
     /// bumped on every Fair tick (new completed play)
     fair_seq: u64,
     /// fair_seq at the last clip fill; adds require a newer play to confirm
