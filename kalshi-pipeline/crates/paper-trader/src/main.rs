@@ -86,7 +86,9 @@ fn d_events() -> Vec<String> {
 fn d_log() -> String { "paper_trades.csv".into() }
 fn d_entry_edge() -> f64 { 10.0 }
 fn d_exit_edge() -> f64 { 2.0 }
-fn d_max_clips() -> usize { 2 }
+// Live QC on 68 trades: 1-clip trades +13.0%, 2-clip -19.6%, 3-clip -29.1%.
+// Averaging into a widening gap selects for model-wrong cases; never add.
+fn d_max_clips() -> usize { 1 }
 fn d_ratings() -> String { "ratings.csv".into() }
 
 /// Weight of the model in the fair-value blend; the rest is market mid.
@@ -95,7 +97,9 @@ const BLEND_W: f64 = 0.5;
 /// Stop opening new positions on a market after this much realized loss (cents).
 const MARKET_LOSS_STOP_C: f64 = -300.0;
 /// Adaptive entry threshold bounds (cents) and P&L window (closed positions).
-const THR_MIN: f64 = 8.0;
+/// Live QC: entries with raw model gaps under ~22c (blended ~11c) ran
+/// negative; only the high-conviction bucket paid. Floor raised accordingly.
+const THR_MIN: f64 = 11.0;
 const THR_MAX: f64 = 15.0;
 const THR_WINDOW: usize = 5;
 
@@ -694,9 +698,14 @@ async fn run_day(
         }
 
         if qty > 0.0 {
+            // salvage rule: every settlement in 68 live trades was a total
+            // loss — winners always exit maker first. In the 9th+ with the
+            // bid near zero, take the scraps instead of riding to settlement.
+            let salvage = pos.inning >= 9 && bid <= 15;
             // taker dump: blended view flipped hard against us; pay the fee
             let fee = taker_fee(qty, bid);
-            if (bid as f64 - fair) - fee * 100.0 / qty.max(1.0) >= adapt.threshold {
+            if salvage
+                || (bid as f64 - fair) - fee * 100.0 / qty.max(1.0) >= adapt.threshold {
                 let cost: f64 = pos.clips.iter().map(|(p, s)| *p as f64 * s).sum();
                 let pnl = bid as f64 * qty - cost - fee * 100.0;
                 pos.clips.clear();
