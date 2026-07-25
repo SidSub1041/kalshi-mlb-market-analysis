@@ -98,9 +98,14 @@ const BLEND_W: f64 = 0.5;
 const MARKET_LOSS_STOP_C: f64 = -300.0;
 /// Adaptive entry threshold bounds (cents) and P&L window (closed positions).
 /// Live QC: entries with raw model gaps under ~22c (blended ~11c) ran
-/// negative; only the high-conviction bucket paid. Floor raised accordingly.
-const THR_MIN: f64 = 11.0;
-const THR_MAX: f64 = 15.0;
+/// negative; only the high-conviction bucket paid. 11c floor then produced
+/// ~1 trade/day for 3 days and pinned the adaptive threshold at max on a
+/// noise window — loosened one notch per the pre-set criterion.
+const THR_MIN: f64 = 10.0;
+const THR_MAX: f64 = 14.0;
+/// Skip entries when the market hasn't ticked recently: a silent book can't
+/// be trusted against live game state (stale-book phantom edges).
+const BOOK_FRESH_S: i64 = 90;
 const THR_WINDOW: usize = 5;
 
 // ---------------------------------------------------------------- order book
@@ -202,7 +207,13 @@ async fn ws_task(signer: Signer, tickers: Vec<String>, tx: mpsc::Sender<Tick>) -
     h.insert("KALSHI-ACCESS-SIGNATURE", sig.parse()?);
     h.insert("KALSHI-ACCESS-TIMESTAMP", ts.parse()?);
 
-    let (ws, _) = tokio_tungstenite::connect_async(req).await.context("ws connect")?;
+    // Un-timed connects were observed hanging 8-17 min on network blips,
+    // freezing books while game state marched on (phantom edges).
+    let (ws, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio_tungstenite::connect_async(req),
+    ).await.map_err(|_| anyhow!("ws connect timed out after 30s"))?
+        .context("ws connect")?;
     let (mut sink, mut stream) = ws.split();
     let sub = serde_json::json!({
         "id": 1, "cmd": "subscribe",
@@ -522,15 +533,18 @@ async fn run_day(
             Tick::Snapshot(t, yes, no) => {
                 n_snap += 1;
                 books.entry(t.clone()).or_default().set_snapshot(&yes, &no);
+                positions.entry(t.clone()).or_default().last_book_tick = Some(now);
                 Some(t)
             }
             Tick::Delta(t, side, price, delta) => {
                 n_delta += 1;
                 books.entry(t.clone()).or_default().apply(&side, price, delta);
+                positions.entry(t.clone()).or_default().last_book_tick = Some(now);
                 Some(t)
             }
             Tick::Trade(t, price, count, _taker) => {
                 n_trade += 1;
+                positions.entry(t.clone()).or_default().last_book_tick = Some(now);
                 // advance queues: sells print at/below our bid; buys at/above our ask
                 if let Some(pos) = positions.get_mut(&t) {
                     for o in [pos.entry.as_mut(), pos.exit.as_mut()].into_iter().flatten() {
@@ -676,9 +690,12 @@ async fn run_day(
         // from inning 7 on, cap the market at a single clip: late-game edges
         // backtest best but settle binary — bound the tail
         let late_capped = pos.inning >= 7 && !pos.clips.is_empty();
+        let book_fresh = pos.last_book_tick
+            .is_some_and(|t| (now - t).num_seconds() <= BOOK_FRESH_S);
         if pos.entry.is_none() && pos.exit.is_none()
             && !other_blocked
             && !late_capped
+            && book_fresh
             && pos.clips.len() < cfg.max_clips
             && fresh_confirmation
             && pos.realized > MARKET_LOSS_STOP_C
@@ -751,6 +768,8 @@ struct Pos {
     exit: Option<SimOrder>,
     /// current inning per the last Fair tick (for the late-game clip cap)
     inning: i64,
+    /// last time this market's book ticked (delta/trade/snapshot)
+    last_book_tick: Option<chrono::DateTime<Utc>>,
     /// bumped on every Fair tick (new completed play)
     fair_seq: u64,
     /// fair_seq at the last clip fill; adds require a newer play to confirm
