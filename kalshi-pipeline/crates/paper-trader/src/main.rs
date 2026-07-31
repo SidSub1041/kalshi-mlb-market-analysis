@@ -101,7 +101,7 @@ const MARKET_LOSS_STOP_C: f64 = -300.0;
 /// negative; only the high-conviction bucket paid. 11c floor then produced
 /// ~1 trade/day for 3 days and pinned the adaptive threshold at max on a
 /// noise window — loosened one notch per the pre-set criterion.
-const THR_MIN: f64 = 10.0;
+const THR_MIN: f64 = 8.0;
 const THR_MAX: f64 = 14.0;
 /// Skip entries when the market hasn't ticked recently: a silent book can't
 /// be trusted against live game state (stale-book phantom edges).
