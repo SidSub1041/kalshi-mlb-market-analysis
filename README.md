@@ -31,9 +31,3 @@ never places real orders. Every strategy change was gated on either the
 882-game backtest or live trade-pattern analysis, and several proposed edges
 were rejected when the data said no (recency/streak weighting, the original
 event-drift strategy).
-
-## Acknowledgments
-
-Developed with Claude (Anthropic) as an AI programming assistant — used for
-implementation, backtesting infrastructure, live-trading diagnostics, and
-analysis tooling under the author's direction.
