@@ -7,7 +7,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>/Users/sid/Claude/Projects/Kalshi MLB market analysis/tracker_server.py</string>
+        <string>/Users/sid/live/kalshi-live/tracker_server.py</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -16,8 +16,8 @@
     <key>ThrottleInterval</key>
     <integer>30</integer>
     <key>StandardOutPath</key>
-    <string>/Users/sid/Claude/Projects/Kalshi MLB market analysis/tracker.log</string>
+    <string>/Users/sid/live/kalshi-live/tracker.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/sid/Claude/Projects/Kalshi MLB market analysis/tracker.log</string>
+    <string>/Users/sid/live/kalshi-live/tracker.log</string>
 </dict>
 </plist>

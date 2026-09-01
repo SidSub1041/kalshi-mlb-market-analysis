@@ -22,7 +22,9 @@ on Kalshi. Built across the 2026 season.
 - **`tracker_server.py`** — live dashboard (period tabs, per-day performance
   attribution, open-position view) served on `localhost:8787`.
 - **`build_workbook.py`** — Excel report generator.
-- **`deploy/`** — launchd agents for fully autonomous daily operation.
+- **`deploy/`** — launchd agents for fully autonomous daily operation, and
+  `setup_live_clone.sh` to run them from an isolated clone (see
+  `deploy/README.md`).
 
 ## Method notes
 
