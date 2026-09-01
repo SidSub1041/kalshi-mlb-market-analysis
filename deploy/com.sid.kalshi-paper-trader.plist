@@ -6,12 +6,12 @@
     <string>com.sid.kalshi-paper-trader</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/sid/Claude/Projects/Kalshi MLB market analysis/kalshi-pipeline/target/release/paper-trader</string>
+        <string>/Users/sid/live/kalshi-live/kalshi-pipeline/target/release/paper-trader</string>
         <string>--config</string>
         <string>config.toml</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/sid/Claude/Projects/Kalshi MLB market analysis/kalshi-pipeline</string>
+    <string>/Users/sid/live/kalshi-live/kalshi-pipeline</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -19,8 +19,8 @@
     <key>ThrottleInterval</key>
     <integer>30</integer>
     <key>StandardOutPath</key>
-    <string>/Users/sid/Claude/Projects/Kalshi MLB market analysis/kalshi-pipeline/paper_trader_live.log</string>
+    <string>/Users/sid/live/kalshi-live/kalshi-pipeline/paper_trader_live.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/sid/Claude/Projects/Kalshi MLB market analysis/kalshi-pipeline/paper_trader_live.log</string>
+    <string>/Users/sid/live/kalshi-live/kalshi-pipeline/paper_trader_live.log</string>
 </dict>
 </plist>
