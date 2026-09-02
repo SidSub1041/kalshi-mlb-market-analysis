@@ -271,6 +271,9 @@ impl KalshiClient {
 
 /// Kalshi API-key auth: RSA-PSS(SHA256) signature over `{timestamp_ms}{METHOD}{path}`.
 /// Returns (timestamp_ms, base64 signature) for the three KALSHI-ACCESS-* headers.
+pub mod portfolio;
+pub mod risk;
+
 pub mod auth {
     use anyhow::{Context, Result};
     use base64::Engine;
