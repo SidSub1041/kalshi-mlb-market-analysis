@@ -66,6 +66,7 @@ pub enum Veto {
     PriceDistance { price: i64, mid: f64, cap: i64 },
     NoMid,
     PriceBounds { price: i64 },
+    BadCount { count: i64 },
 }
 
 impl std::fmt::Display for Veto {
@@ -83,6 +84,7 @@ impl std::fmt::Display for Veto {
                 f, "price sanity: {price}c is more than {cap}c from mid {mid:.1}c"),
             Veto::NoMid => write!(f, "no trustworthy mid for market"),
             Veto::PriceBounds { price } => write!(f, "price {price}c outside 1-99"),
+            Veto::BadCount { count } => write!(f, "count {count} not a positive integer"),
         }
     }
 }
@@ -97,6 +99,9 @@ pub struct RiskBook {
     realized_today: i64,
     /// Timestamps of recently sent orders (for the rate cap).
     sent: VecDeque<DateTime<Utc>>,
+    /// Approved-but-unfilled cost basis per market, cents. Reserved at
+    /// approve() time; released on fill (converted) or cancel/reject.
+    pending: HashMap<String, i64>,
 }
 
 impl RiskBook {
@@ -111,28 +116,39 @@ impl RiskBook {
         if chk.price_cents < 1 || chk.price_cents > 99 {
             return Err(Veto::PriceBounds { price: chk.price_cents });
         }
+        if chk.count <= 0 {
+            return Err(Veto::BadCount { count: chk.count });
+        }
         if self.realized_today <= -self.limits.daily_loss_stop_cents {
             return Err(Veto::DailyLoss {
                 realized_cents: self.realized_today,
                 stop: self.limits.daily_loss_stop_cents,
             });
         }
-        let Some(mid) = chk.mid_cents else { return Err(Veto::NoMid) };
+        // NaN/inf mids are as untrustworthy as no mid at all.
+        let Some(mid) = chk.mid_cents.filter(|m| m.is_finite()) else {
+            return Err(Veto::NoMid);
+        };
         if (chk.price_cents as f64 - mid).abs() > self.limits.max_price_distance_cents as f64 {
             return Err(Veto::PriceDistance {
                 price: chk.price_cents, mid,
                 cap: self.limits.max_price_distance_cents,
             });
         }
+        // Caps count filled AND in-flight (approved-but-unfilled) exposure.
+        // Without the pending reservation, a burst of approvals could each
+        // pass individually and blow through the caps once they all fill.
         let order_cents = chk.price_cents * chk.count;
-        let market_open = *self.exposure.get(chk.ticker).unwrap_or(&0);
+        let market_open = *self.exposure.get(chk.ticker).unwrap_or(&0)
+            + *self.pending.get(chk.ticker).unwrap_or(&0);
         if market_open + order_cents > self.limits.per_market_cap_cents {
             return Err(Veto::MarketCap {
                 ticker: chk.ticker.to_string(), open_cents: market_open,
                 order_cents, cap: self.limits.per_market_cap_cents,
             });
         }
-        let total_open: i64 = self.exposure.values().sum();
+        let total_open: i64 = self.exposure.values().sum::<i64>()
+            + self.pending.values().sum::<i64>();
         if total_open + order_cents > self.limits.max_exposure_cents {
             return Err(Veto::ExposureCap {
                 open_cents: total_open, order_cents,
@@ -147,12 +163,34 @@ impl RiskBook {
             return Err(Veto::OrderRate { in_window: self.sent.len(), cap: self.limits.max_orders_per_min });
         }
         self.sent.push_back(now);
+        *self.pending.entry(chk.ticker.to_string()).or_insert(0) += order_cents;
         Ok(())
+    }
+
+    /// The order approved for `reserved_cents` was cancelled, rejected, or
+    /// definitively failed to send: release its reservation.
+    pub fn release_pending(&mut self, ticker: &str, reserved_cents: i64) {
+        if let Some(p) = self.pending.get_mut(ticker) {
+            *p = (*p - reserved_cents).max(0);
+            if *p == 0 { self.pending.remove(ticker); }
+        }
+    }
+
+    /// An entry fill converted reservation into real exposure.
+    pub fn on_fill_open(&mut self, ticker: &str, cost_cents: i64) {
+        self.release_pending(ticker, cost_cents);
+        self.on_exposure_change(ticker, cost_cents);
     }
 
     /// A fill increased (positive cents) or decreased open cost basis.
     pub fn on_exposure_change(&mut self, ticker: &str, delta_cents: i64) {
         let e = self.exposure.entry(ticker.to_string()).or_insert(0);
+        if *e + delta_cents < 0 {
+            // Clamped in the conservative direction, but drift means the
+            // executor's accounting and ours disagree — make it visible.
+            tracing::warn!(ticker, open = *e, delta = delta_cents,
+                           "exposure over-decrement clamped to 0");
+        }
         *e = (*e + delta_cents).max(0);
         if *e == 0 { self.exposure.remove(ticker); }
     }
@@ -191,8 +229,11 @@ pub fn is_locked_out(dir: &Path, now: DateTime<Utc>) -> bool {
     lockout_path(dir, trading_date(now)).exists()
 }
 
-/// The trading "day" flips at 4 AM ET (8h behind UTC), matching the slate
-/// anchor used everywhere else in this codebase.
+/// The trading "day" flips at a FIXED 08:00 UTC boundary (matching the slate
+/// anchor used everywhere else in this codebase). That is 4 AM ET during
+/// daylight time and 3 AM ET during standard time — the one-hour winter
+/// drift is accepted deliberately to keep the anchor DST-free; it only
+/// matters for games running past 3 AM EST (post-season territory).
 pub fn trading_date(now: DateTime<Utc>) -> NaiveDate {
     (now - chrono::Duration::hours(8)).date_naive()
 }
@@ -313,6 +354,36 @@ mod tests {
         std::fs::write(dir.join("KILL"), "").unwrap();
         assert!(kill_requested(&dir));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pending_reservation_blocks_burst_approvals() {
+        let mut rb = RiskBook::new(Limits::default());
+        // First 400c order approved and reserved.
+        assert!(rb.approve(t0(), &chk("A", 40, 10)).is_ok());
+        // Second identical order must now exceed the 500c per-market cap
+        // even though nothing has filled yet.
+        let v = rb.approve(t0(), &chk("A", 40, 10)).unwrap_err();
+        assert!(matches!(v, Veto::MarketCap { .. }));
+        // Cancel releases the reservation; approval works again.
+        rb.release_pending("A", 400);
+        assert!(rb.approve(t0(), &chk("A", 40, 10)).is_ok());
+        // Fill converts reservation to real exposure — still capped.
+        rb.on_fill_open("A", 400);
+        assert!(matches!(rb.approve(t0(), &chk("A", 40, 10)).unwrap_err(),
+                         Veto::MarketCap { .. }));
+    }
+
+    #[test]
+    fn vetoes_nan_mid_and_bad_count() {
+        let mut rb = RiskBook::new(Limits::default());
+        let mut c = chk("A", 40, 1);
+        c.mid_cents = Some(f64::NAN);
+        assert!(matches!(rb.approve(t0(), &c).unwrap_err(), Veto::NoMid));
+        assert!(matches!(rb.approve(t0(), &chk("A", 40, 0)).unwrap_err(),
+                         Veto::BadCount { .. }));
+        assert!(matches!(rb.approve(t0(), &chk("A", 40, -5)).unwrap_err(),
+                         Veto::BadCount { .. }));
     }
 
     #[test]

@@ -41,11 +41,12 @@ impl PortfolioClient {
             .header("KALSHI-ACCESS-TIMESTAMP", ts)
             .send().await?;
         let status = resp.status();
-        let body: Value = resp.json().await.context("portfolio json")?;
+        let text = resp.text().await.context("portfolio body")?;
         if !status.is_success() {
-            anyhow::bail!("portfolio GET {rel} -> {status}: {body}");
+            anyhow::bail!("portfolio GET {rel} -> {status}: {}",
+                          text.chars().take(300).collect::<String>());
         }
-        Ok(body)
+        serde_json::from_str(&text).context("portfolio json")
     }
 
     /// Account balance in cents.
@@ -55,29 +56,56 @@ impl PortfolioClient {
     }
 
     /// Open market positions: (ticker, signed contracts, raw record).
-    /// Positive contracts = long YES.
+    /// Positive contracts = long YES. Follows cursor pagination so a large
+    /// account is never silently truncated.
     pub async fn positions(&self) -> Result<Vec<(String, i64, Value)>> {
-        let v = self.get("/portfolio/positions?limit=200").await?;
         let mut out = Vec::new();
-        for p in v["market_positions"].as_array().unwrap_or(&vec![]) {
-            let ticker = p["ticker"].as_str().unwrap_or("").to_string();
-            let pos = p["position"].as_i64().unwrap_or(0);
-            if !ticker.is_empty() && pos != 0 {
-                out.push((ticker, pos, p.clone()));
+        let mut cursor = String::new();
+        loop {
+            let rel = if cursor.is_empty() {
+                "/portfolio/positions?limit=200".to_string()
+            } else {
+                format!("/portfolio/positions?limit=200&cursor={cursor}")
+            };
+            let v = self.get(&rel).await?;
+            for p in v["market_positions"].as_array().unwrap_or(&vec![]) {
+                let ticker = p["ticker"].as_str().unwrap_or("").to_string();
+                let pos = p["position"].as_i64().unwrap_or(0);
+                if !ticker.is_empty() && pos != 0 {
+                    out.push((ticker, pos, p.clone()));
+                }
+            }
+            match v["cursor"].as_str() {
+                Some(c) if !c.is_empty() => cursor = c.to_string(),
+                _ => break,
             }
         }
         Ok(out)
     }
 
-    /// Resting (open) orders: (order_id, ticker, raw record).
+    /// Resting (open) orders: (order_id, ticker, raw record). Follows cursor
+    /// pagination; an executor cancel-all should still loop
+    /// "cancel, refetch, repeat until empty" to verify cancels landed.
     pub async fn resting_orders(&self) -> Result<Vec<(String, String, Value)>> {
-        let v = self.get("/portfolio/orders?status=resting&limit=200").await?;
         let mut out = Vec::new();
-        for o in v["orders"].as_array().unwrap_or(&vec![]) {
-            let id = o["order_id"].as_str().unwrap_or("").to_string();
-            let ticker = o["ticker"].as_str().unwrap_or("").to_string();
-            if !id.is_empty() {
-                out.push((id, ticker, o.clone()));
+        let mut cursor = String::new();
+        loop {
+            let rel = if cursor.is_empty() {
+                "/portfolio/orders?status=resting&limit=200".to_string()
+            } else {
+                format!("/portfolio/orders?status=resting&limit=200&cursor={cursor}")
+            };
+            let v = self.get(&rel).await?;
+            for o in v["orders"].as_array().unwrap_or(&vec![]) {
+                let id = o["order_id"].as_str().unwrap_or("").to_string();
+                let ticker = o["ticker"].as_str().unwrap_or("").to_string();
+                if !id.is_empty() {
+                    out.push((id, ticker, o.clone()));
+                }
+            }
+            match v["cursor"].as_str() {
+                Some(c) if !c.is_empty() => cursor = c.to_string(),
+                _ => break,
             }
         }
         Ok(out)

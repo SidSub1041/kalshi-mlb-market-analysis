@@ -13,32 +13,53 @@ from datetime import datetime
 
 
 def load(path):
-    """-> closed trades [{ticker, entry_ts, avg_entry, qty, pnl, cost}], entries count"""
-    open_clips, closed, n_entries = {}, [], 0
+    """-> closed trades, entries count, orphan exit count, (min_ts, max_ts).
+
+    Partial-fill aware: an exit row closes only its own `size`, consuming
+    open clips FIFO, so executors that exit in slices are accounted
+    correctly instead of the first exit swallowing the whole position.
+    """
+    open_clips, closed, n_entries, orphans = {}, [], 0, 0
+    lo = hi = None
     for r in csv.DictReader(open(path)):
         act = r.get('action')
         if not act:
             continue
+        ts = datetime.fromisoformat(r['ts'].replace('Z', '+00:00'))
+        lo = ts if lo is None or ts < lo else lo
+        hi = ts if hi is None or ts > hi else hi
         t = r['ticker']
         if act in ('entry', 'add'):
             n_entries += 1
-            open_clips.setdefault(t, []).append(r)
+            open_clips.setdefault(t, []).append(
+                {'ts': ts, 'price': float(r['price_cents']), 'size': float(r['size'])})
         elif act in ('exit_maker', 'exit_taker', 'settle'):
-            clips = open_clips.pop(t, [])
+            clips = open_clips.get(t)
             if not clips:
+                orphans += 1
                 continue
-            cost = sum(float(c['price_cents']) * float(c['size']) for c in clips)
-            qty = sum(float(c['size']) for c in clips)
+            want = float(r['size'] or 0) or sum(c['size'] for c in clips)
+            take, cost, first_ts = 0.0, 0.0, clips[0]['ts']
+            while clips and take < want - 1e-9:
+                c = clips[0]
+                use = min(c['size'], want - take)
+                take += use
+                cost += use * c['price']
+                c['size'] -= use
+                if c['size'] <= 1e-9:
+                    clips.pop(0)
+            if not clips:
+                open_clips.pop(t, None)
             closed.append({
                 'ticker': t,
-                'entry_ts': datetime.fromisoformat(clips[0]['ts'].replace('Z', '+00:00')),
-                'avg_entry': cost / qty if qty else 0.0,
-                'qty': qty,
+                'entry_ts': first_ts,
+                'avg_entry': cost / take if take else 0.0,
+                'qty': take,
                 'cost': cost,
                 'pnl': float(r['pnl_cents'] or 0),
                 'exit_mode': act,
             })
-    return closed, n_entries
+    return closed, n_entries, orphans, (lo, hi)
 
 
 def summarize(label, closed, n_entries):
@@ -53,42 +74,68 @@ def summarize(label, closed, n_entries):
 
 
 def main(shadow_path, real_path):
-    shadow, s_entries = load(shadow_path)
-    real, r_entries = load(real_path)
-    print("=== totals ===")
-    s_pnl, s_cost = summarize('shadow', shadow, s_entries)
-    r_pnl, r_cost = summarize('real', real, r_entries)
+    shadow, s_entries, s_orph, s_span = load(shadow_path)
+    real, r_entries, r_orph, r_span = load(real_path)
+    print("=== totals (entire files) ===")
+    summarize('shadow', shadow, s_entries)
+    summarize('real', real, r_entries)
+    if s_orph or r_orph:
+        print(f"orphan exit rows (no open clips; excluded): "
+              f"shadow {s_orph}, real {r_orph}")
 
-    print("\n=== fill rate ===")
-    if s_entries:
-        print(f"real entries per shadow entry: {r_entries / s_entries:.2f} "
+    # Restrict comparisons to the window covered by BOTH logs.
+    if None in (*s_span, *r_span):
+        print("\none of the logs is empty — nothing to compare")
+        return
+    lo, hi = max(s_span[0], r_span[0]), min(s_span[1], r_span[1])
+    if lo >= hi:
+        print("\nno overlapping time window between the two logs")
+        return
+    sh = [c for c in shadow if lo <= c['entry_ts'] <= hi]
+    re = [c for c in real if lo <= c['entry_ts'] <= hi]
+    print(f"\n=== overlap window {lo:%Y-%m-%d %H:%M} -> {hi:%Y-%m-%d %H:%M} UTC ===")
+    print(f"closed in window: shadow {len(sh)}, real {len(re)}")
+    if sh:
+        print(f"fill ratio (real/shadow closed in window): {len(re)/len(sh):.2f} "
               f"(<1.0 means the sim over-promises fills)")
 
-    # Match closed trades by ticker + nearest entry time (within 10 min).
-    by_ticker = defaultdict(list)
-    for c in real:
-        by_ticker[c['ticker']].append(c)
-    matched, price_delta, pnl_delta = 0, 0.0, 0.0
-    for s in shadow:
-        cands = [r for r in by_ticker[s['ticker']]
-                 if abs((r['entry_ts'] - s['entry_ts']).total_seconds()) < 600]
-        if not cands:
+    # One-to-one greedy matching by ticker + nearest entry time (10-min cap),
+    # smallest time gaps first, each real trade consumed at most once.
+    pairs = []
+    for si, s_t in enumerate(sh):
+        for ri, r_t in enumerate(re):
+            if r_t['ticker'] != s_t['ticker']:
+                continue
+            gap = abs((r_t['entry_ts'] - s_t['entry_ts']).total_seconds())
+            if gap < 600:
+                pairs.append((gap, si, ri))
+    pairs.sort()
+    used_s, used_r, matches = set(), set(), []
+    for gap, si, ri in pairs:
+        if si in used_s or ri in used_r:
             continue
-        r = min(cands, key=lambda r: abs((r['entry_ts'] - s['entry_ts']).total_seconds()))
-        matched += 1
-        price_delta += r['avg_entry'] - s['avg_entry']
-        pnl_delta += (r['pnl'] / r['qty'] if r['qty'] else 0) - \
-                     (s['pnl'] / s['qty'] if s['qty'] else 0)
-    print(f"\n=== matched round trips (same ticker, entries within 10 min): {matched} ===")
-    if matched:
-        print(f"avg entry price slippage: {price_delta / matched:+.2f}c/contract "
-              f"(positive = real fills at worse prices)")
-        print(f"avg per-contract P&L gap:  {pnl_delta / matched:+.2f}c/contract "
+        used_s.add(si); used_r.add(ri)
+        matches.append((sh[si], re[ri]))
+    price_delta = sum(r['avg_entry'] - s['avg_entry'] for s, r in matches)
+    pnl_delta = sum((r['pnl'] / r['qty'] if r['qty'] else 0)
+                    - (s['pnl'] / s['qty'] if s['qty'] else 0)
+                    for s, r in matches)
+    m = len(matches)
+    print(f"\n=== one-to-one matches (same ticker, entries within 10 min): {m} ===")
+    print(f"unmatched: shadow {len(sh) - m} (sim filled, reality didn't), "
+          f"real {len(re) - m} (reality filled, sim didn't)")
+    if m:
+        print(f"avg entry price slippage: {price_delta / m:+.2f}c/contract "
+              f"(positive = real fills at worse prices; assumes yes-buy entries)")
+        print(f"avg per-contract P&L gap:  {pnl_delta / m:+.2f}c/contract "
               f"(negative = reality underperforms the sim)")
-        print("\nGate 5 read: apply the P&L gap to the sim's historical edge — "
-              "if edge minus gap <= 0, the strategy does not survive real fills.")
+        print("\nGate 5 read: the gap is measured only on trades BOTH tracks "
+              "filled, so treat it as a lower bound on true slippage — "
+              "shadow-only fills above are pure sim optimism on top of it. "
+              "If sim edge minus this gap <= 0, the strategy does not survive "
+              "real fills.")
     else:
-        print("no matches — need overlapping sessions of both logs")
+        print("no matches — need overlapping sessions with shared tickers")
 
 
 if __name__ == '__main__':
