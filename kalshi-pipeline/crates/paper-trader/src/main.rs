@@ -26,7 +26,7 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{Duration as ChronoDur, Utc};
 use clap::Parser;
-use common::{auth::Signer, KalshiClient, MlbClient, PlayRow, KALSHI_WS};
+use common::{auth::Signer, KalshiClient, MlbClient, PlayRow};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -74,6 +74,12 @@ struct Config {
     max_clips: usize,
     #[serde(default = "d_ratings")]
     ratings_path: String,
+    /// Kalshi REST base. Point at the demo host to run against fake money.
+    #[serde(default = "d_api_base")]
+    api_base: String,
+    /// Kalshi websocket base. Must match the environment of `api_base`.
+    #[serde(default = "d_ws_base")]
+    ws_base: String,
 }
 fn d_size() -> f64 { 10.0 }
 fn d_hold() -> i64 { 5 }
@@ -90,6 +96,8 @@ fn d_exit_edge() -> f64 { 2.0 }
 // Averaging into a widening gap selects for model-wrong cases; never add.
 fn d_max_clips() -> usize { 1 }
 fn d_ratings() -> String { "ratings.csv".into() }
+fn d_api_base() -> String { common::KALSHI_BASE.into() }
+fn d_ws_base() -> String { common::KALSHI_WS.into() }
 
 /// Weight of the model in the fair-value blend; the rest is market mid.
 /// 0.5 was the best Brier in the season backtest (beats model and market).
@@ -199,9 +207,9 @@ fn fp_qty(v: &serde_json::Value) -> Option<f64> {
     v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
-async fn ws_task(signer: Signer, tickers: Vec<String>, tx: mpsc::Sender<Tick>) -> Result<()> {
+async fn ws_task(ws_base: String, signer: Signer, tickers: Vec<String>, tx: mpsc::Sender<Tick>) -> Result<()> {
     let (ts, sig) = signer.headers("GET", "/trade-api/ws/v2")?;
-    let mut req = KALSHI_WS.into_client_request()?;
+    let mut req = ws_base.as_str().into_client_request()?;
     let h = req.headers_mut();
     h.insert("KALSHI-ACCESS-KEY", signer.key_id.parse()?);
     h.insert("KALSHI-ACCESS-SIGNATURE", sig.parse()?);
@@ -423,7 +431,7 @@ async fn run_day(
     let mut cursor = String::new();
     loop {
         let mut url = format!("{}/events?series_ticker=KXMLBGAME&status=open&limit=200&with_nested_markets=true",
-                              common::KALSHI_BASE);
+                              cfg.api_base);
         if !cursor.is_empty() { url.push_str(&format!("&cursor={cursor}")); }
         let resp: EventsResp = kalshi.get_json(&url).await?;
         for ev in &resp.events {
@@ -497,9 +505,10 @@ async fn run_day(
         let tx = tx.clone();
         let tickers = tickers.clone();
         let signer = signer.clone();
+        let ws_base = cfg.ws_base.clone();
         async move {
             loop {
-                if let Err(e) = ws_task(signer.clone(), tickers.clone(), tx.clone()).await {
+                if let Err(e) = ws_task(ws_base.clone(), signer.clone(), tickers.clone(), tx.clone()).await {
                     tracing::warn!(%e, "ws task died; reconnecting in 5s");
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
