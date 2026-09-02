@@ -11,3 +11,20 @@ exit_timeout_s = 120   # maker exit wait before crossing the spread
 max_spread_cents = 2   # skip signals on wide books
 entry_events = ["home_run", "single", "double", "triple", "walk", "hit_by_pitch"]
 log_path = "paper_trades.csv"
+
+# Environment. Start with the demo endpoints; production needs both explicit
+# switches in the executor as well as a separately funded live API key.
+api_base = "https://external-api.demo.kalshi.co/trade-api/v2"
+ws_base = "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2"
+
+# Live execution is deliberately disabled. These values are consumed by the
+# future executor, not the paper-trader binary.
+live_enabled = false
+confirm_prod = false
+max_exposure_cents = 2500
+per_market_cap_cents = 500
+daily_loss_stop_cents = 500
+max_orders_per_min = 10
+max_price_distance_cents = 5
+adopt_positions_on_boot = false
+balance_floor_cents = 0

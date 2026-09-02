@@ -35,16 +35,21 @@ impl PortfolioClient {
         let url = reqwest::Url::parse(&full).context("portfolio url")?;
         let path = url.path().to_string();
         let (ts, sig) = self.signer.headers("GET", &path)?;
-        let resp = self.http.get(url)
+        let resp = self
+            .http
+            .get(url)
             .header("KALSHI-ACCESS-KEY", &self.signer.key_id)
             .header("KALSHI-ACCESS-SIGNATURE", sig)
             .header("KALSHI-ACCESS-TIMESTAMP", ts)
-            .send().await?;
+            .send()
+            .await?;
         let status = resp.status();
         let text = resp.text().await.context("portfolio body")?;
         if !status.is_success() {
-            anyhow::bail!("portfolio GET {rel} -> {status}: {}",
-                          text.chars().take(300).collect::<String>());
+            anyhow::bail!(
+                "portfolio GET {rel} -> {status}: {}",
+                text.chars().take(300).collect::<String>()
+            );
         }
         serde_json::from_str(&text).context("portfolio json")
     }
@@ -58,7 +63,7 @@ impl PortfolioClient {
     /// Open market positions: (ticker, signed contracts, raw record).
     /// Positive contracts = long YES. Follows cursor pagination so a large
     /// account is never silently truncated.
-    pub async fn positions(&self) -> Result<Vec<(String, i64, Value)>> {
+    pub async fn positions(&self) -> Result<Vec<(String, f64, Value)>> {
         let mut out = Vec::new();
         let mut cursor = String::new();
         loop {
@@ -70,8 +75,14 @@ impl PortfolioClient {
             let v = self.get(&rel).await?;
             for p in v["market_positions"].as_array().unwrap_or(&vec![]) {
                 let ticker = p["ticker"].as_str().unwrap_or("").to_string();
-                let pos = p["position"].as_i64().unwrap_or(0);
-                if !ticker.is_empty() && pos != 0 {
+                // Kalshi's current response uses fixed-point `position_fp`.
+                // Retain the old integer field as a compatibility fallback.
+                let pos = p["position_fp"]
+                    .as_str()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .or_else(|| p["position"].as_i64().map(|v| v as f64))
+                    .unwrap_or(0.0);
+                if !ticker.is_empty() && pos != 0.0 {
                     out.push((ticker, pos, p.clone()));
                 }
             }
@@ -132,22 +143,26 @@ pub struct Fill {
 /// and dollars_fp string encodings, mirroring the market-data channels.
 pub fn parse_fill(m: &Value) -> Option<Fill> {
     let cents = |v: &Value| -> Option<i64> {
-        v.as_str().and_then(|s| s.parse::<f64>().ok())
+        v.as_str()
+            .and_then(|s| s.parse::<f64>().ok())
             .map(|d| (d * 100.0).round() as i64)
             .or_else(|| v.as_i64())
     };
     let qty = |v: &Value| -> Option<f64> {
-        v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
     };
     Some(Fill {
         trade_id: m["trade_id"].as_str()?.to_string(),
         order_id: m["order_id"].as_str().unwrap_or("").to_string(),
-        ticker: m["market_ticker"].as_str().or(m["ticker"].as_str())?.to_string(),
+        ticker: m["market_ticker"]
+            .as_str()
+            .or(m["ticker"].as_str())?
+            .to_string(),
         side: m["side"].as_str().unwrap_or("yes").to_string(),
         action: m["action"].as_str().unwrap_or("").to_string(),
         count: qty(&m["count_fp"]).or_else(|| qty(&m["count"]))?,
-        yes_price_cents: cents(&m["yes_price_dollars"])
-            .or_else(|| cents(&m["yes_price"]))?,
+        yes_price_cents: cents(&m["yes_price_dollars"]).or_else(|| cents(&m["yes_price"]))?,
         is_taker: m["is_taker"].as_bool().unwrap_or(false),
     })
 }

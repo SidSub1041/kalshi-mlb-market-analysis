@@ -11,8 +11,11 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
-pub const KALSHI_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
-pub const KALSHI_WS: &str = "wss://api.elections.kalshi.com/trade-api/ws/v2";
+/// Preferred dedicated production REST host. The older shared host remains
+/// supported by Kalshi, but new integrations should use this one.
+pub const KALSHI_BASE: &str = "https://external-api.kalshi.com/trade-api/v2";
+/// Preferred dedicated production WebSocket host.
+pub const KALSHI_WS: &str = "wss://external-api-ws.kalshi.com/trade-api/ws/v2";
 pub const MLB_BASE: &str = "https://statsapi.mlb.com";
 
 // ---------------------------------------------------------------- rate limit
@@ -133,7 +136,7 @@ pub struct Trade {
     pub count_fp: String,
     pub yes_price_dollars: String,
     pub no_price_dollars: String,
-    pub taker_side: String,      // "yes" | "no"
+    pub taker_side: String, // "yes" | "no"
     #[serde(default)]
     pub taker_book_side: String, // "bid" | "ask"
 }
@@ -269,6 +272,7 @@ impl KalshiClient {
 
 // ---------------------------------------------------------------- auth (WS / orders)
 
+pub mod orders;
 /// Kalshi API-key auth: RSA-PSS(SHA256) signature over `{timestamp_ms}{METHOD}{path}`.
 /// Returns (timestamp_ms, base64 signature) for the three KALSHI-ACCESS-* headers.
 pub mod portfolio;
@@ -295,7 +299,10 @@ pub mod auth {
                 .with_context(|| format!("reading private key {path}"))?;
             let key = RsaPrivateKey::from_pkcs8_pem(&pem)
                 .context("parsing PKCS#8 PEM private key (export the key Kalshi gave you)")?;
-            Ok(Self { key_id: key_id.to_string(), key })
+            Ok(Self {
+                key_id: key_id.to_string(),
+                key,
+            })
         }
 
         /// `path` must include the API prefix, e.g. "/trade-api/ws/v2".
@@ -305,7 +312,10 @@ pub mod auth {
             let signing_key = SigningKey::<Sha256>::new(self.key.clone());
             let mut rng = rand_core::OsRng;
             let sig = signing_key.sign_with_rng(&mut rng, msg.as_bytes());
-            Ok((ts, base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())))
+            Ok((
+                ts,
+                base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
+            ))
         }
     }
 }
@@ -421,18 +431,20 @@ impl MlbClient {
 
     /// date "YYYY-MM-DD" -> vec of (gamePk, awayAbbrev, homeAbbrev, gameDateIso)
     pub async fn schedule(&self, date: &str) -> Result<Vec<(i64, String, String, String)>> {
-        let url = format!(
-            "{MLB_BASE}/api/v1/schedule?sportId=1&date={date}&hydrate=team"
-        );
+        let url = format!("{MLB_BASE}/api/v1/schedule?sportId=1&date={date}&hydrate=team");
         let v = self.get(&url).await?;
         let mut out = Vec::new();
         for d in v["dates"].as_array().unwrap_or(&vec![]) {
             for g in d["games"].as_array().unwrap_or(&vec![]) {
                 let pk = g["gamePk"].as_i64().unwrap_or(0);
                 let away = g["teams"]["away"]["team"]["abbreviation"]
-                    .as_str().unwrap_or("").to_string();
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
                 let home = g["teams"]["home"]["team"]["abbreviation"]
-                    .as_str().unwrap_or("").to_string();
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
                 let dt = g["gameDate"].as_str().unwrap_or("").to_string();
                 if pk > 0 {
                     out.push((pk, away, home, dt));
@@ -474,7 +486,9 @@ impl MlbClient {
         );
         let v = self.get(&url).await?;
         let status = v["gameData"]["status"]["abstractGameState"]
-            .as_str().unwrap_or("").to_string();
+            .as_str()
+            .unwrap_or("")
+            .to_string();
         Ok((Self::plays_from_gumbo(&v), status))
     }
 
@@ -482,7 +496,10 @@ impl MlbClient {
     pub fn plays_from_gumbo(v: &serde_json::Value) -> Vec<PlayRow> {
         let mut out = Vec::new();
         let empty = vec![];
-        for p in v["liveData"]["plays"]["allPlays"].as_array().unwrap_or(&empty) {
+        for p in v["liveData"]["plays"]["allPlays"]
+            .as_array()
+            .unwrap_or(&empty)
+        {
             if !p["about"]["isComplete"].as_bool().unwrap_or(false) {
                 continue;
             }
@@ -526,18 +543,30 @@ pub mod wp {
 
     /// RE24 run-expectancy: (outs, on1, on2, on3) -> expected runs, rest of inning.
     const RE24: [((i64, bool, bool, bool), f64); 24] = [
-        ((0,false,false,false),0.481),((0,true,false,false),0.859),
-        ((0,false,true,false),1.100),((0,false,false,true),1.350),
-        ((0,true,true,false),1.437),((0,true,false,true),1.784),
-        ((0,false,true,true),1.964),((0,true,true,true),2.292),
-        ((1,false,false,false),0.254),((1,true,false,false),0.509),
-        ((1,false,true,false),0.664),((1,false,false,true),0.950),
-        ((1,true,true,false),0.884),((1,true,false,true),1.130),
-        ((1,false,true,true),1.376),((1,true,true,true),1.541),
-        ((2,false,false,false),0.098),((2,true,false,false),0.224),
-        ((2,false,true,false),0.319),((2,false,false,true),0.353),
-        ((2,true,true,false),0.429),((2,true,false,true),0.478),
-        ((2,false,true,true),0.580),((2,true,true,true),0.752),
+        ((0, false, false, false), 0.481),
+        ((0, true, false, false), 0.859),
+        ((0, false, true, false), 1.100),
+        ((0, false, false, true), 1.350),
+        ((0, true, true, false), 1.437),
+        ((0, true, false, true), 1.784),
+        ((0, false, true, true), 1.964),
+        ((0, true, true, true), 2.292),
+        ((1, false, false, false), 0.254),
+        ((1, true, false, false), 0.509),
+        ((1, false, true, false), 0.664),
+        ((1, false, false, true), 0.950),
+        ((1, true, true, false), 0.884),
+        ((1, true, false, true), 1.130),
+        ((1, false, true, true), 1.376),
+        ((1, true, true, true), 1.541),
+        ((2, false, false, false), 0.098),
+        ((2, true, false, false), 0.224),
+        ((2, false, true, false), 0.319),
+        ((2, false, false, true), 0.353),
+        ((2, true, true, false), 0.429),
+        ((2, true, false, true), 0.478),
+        ((2, false, true, true), 0.580),
+        ((2, true, true, true), 0.752),
     ];
     const LEAGUE_HALF_MU: f64 = 0.481;
     const HALF_VAR: f64 = 1.12;
@@ -547,8 +576,10 @@ pub mod wp {
     pub const CALIB_B: f64 = 1.8967;
 
     fn re24(outs: i64, on1: bool, on2: bool, on3: bool) -> f64 {
-        RE24.iter().find(|(k, _)| *k == (outs, on1, on2, on3))
-            .map(|(_, v)| *v).unwrap_or(LEAGUE_HALF_MU)
+        RE24.iter()
+            .find(|(k, _)| *k == (outs, on1, on2, on3))
+            .map(|(_, v)| *v)
+            .unwrap_or(LEAGUE_HALF_MU)
     }
 
     /// team -> (offense, defense) rating, 1.0 = league average.
@@ -561,8 +592,10 @@ pub mod wp {
             let mut rdr = csv::Reader::from_path(path)?;
             for rec in rdr.records() {
                 let r = rec?;
-                m.insert(r[0].to_string(),
-                         (r[1].parse::<f64>()?, r[2].parse::<f64>()?));
+                m.insert(
+                    r[0].to_string(),
+                    (r[1].parse::<f64>()?, r[2].parse::<f64>()?),
+                );
             }
             Ok(Self(m))
         }
@@ -580,27 +613,35 @@ pub mod wp {
         let mu_a = LEAGUE_HALF_MU * o_a * d_h;
 
         let lead = (play.home_score - play.away_score) as f64;
-        let (mut outs, mut on) =
-            (play.outs_after, (play.on1_after, play.on2_after, play.on3_after));
+        let (mut outs, mut on) = (
+            play.outs_after,
+            (play.on1_after, play.on2_after, play.on3_after),
+        );
         let mid_inning_done = outs >= 3;
-        if mid_inning_done { outs = 0; on = (false, false, false); }
+        if mid_inning_done {
+            outs = 0;
+            on = (false, false, false);
+        }
 
         let inn = play.inning.min(9);
-        let (rem_a, rem_h, partial, partial_side): (f64, f64, f64, f64) =
-            if play.half == "top" {
-                let (ra, rh) = ((9 - inn) as f64, (9 - inn + 1) as f64);
-                if mid_inning_done { (ra, rh, 0.0, 0.0) }
-                else { (ra, rh, re24(outs, on.0, on.1, on.2) * (o_a * d_h), -1.0) }
+        let (rem_a, rem_h, partial, partial_side): (f64, f64, f64, f64) = if play.half == "top" {
+            let (ra, rh) = ((9 - inn) as f64, (9 - inn + 1) as f64);
+            if mid_inning_done {
+                (ra, rh, 0.0, 0.0)
             } else {
-                let (ra, rh) = ((9 - inn) as f64, (9 - inn) as f64);
-                if mid_inning_done { (ra, rh, 0.0, 0.0) }
-                else { (ra, rh, re24(outs, on.0, on.1, on.2) * (o_h * d_a), 1.0) }
-            };
+                (ra, rh, re24(outs, on.0, on.1, on.2) * (o_a * d_h), -1.0)
+            }
+        } else {
+            let (ra, rh) = ((9 - inn) as f64, (9 - inn) as f64);
+            if mid_inning_done {
+                (ra, rh, 0.0, 0.0)
+            } else {
+                (ra, rh, re24(outs, on.0, on.1, on.2) * (o_h * d_a), 1.0)
+            }
+        };
 
-        let exp_diff = lead + rem_h * mu_h - rem_a * mu_a
-            + partial_side * partial + HOME_EDGE;
-        let n_half = (rem_a + rem_h + if partial_side == 0.0 { 0.0 } else { 1.0 })
-            .max(1.0);
+        let exp_diff = lead + rem_h * mu_h - rem_a * mu_a + partial_side * partial + HOME_EDGE;
+        let n_half = (rem_a + rem_h + if partial_side == 0.0 { 0.0 } else { 1.0 }).max(1.0);
         let z = exp_diff / (n_half * HALF_VAR).sqrt();
         1.0 / (1.0 + (-(CALIB_A + CALIB_B * z)).exp())
     }
@@ -613,7 +654,10 @@ mod tests {
     #[test]
     fn parses_event_teams() {
         let (d, a, h) = parse_event_teams("KXMLBGAME-26JUN301905DETNYY").unwrap();
-        assert_eq!((d.as_str(), a.as_str(), h.as_str()), ("26JUN30", "DET", "NYY"));
+        assert_eq!(
+            (d.as_str(), a.as_str(), h.as_str()),
+            ("26JUN30", "DET", "NYY")
+        );
         let (_, a, h) = parse_event_teams("KXMLBGAME-26JUN302140LAASEA").unwrap();
         assert_eq!((a.as_str(), h.as_str()), ("LAA", "SEA"));
         // 2-then-3 split: AZ vs SEA
@@ -628,10 +672,21 @@ mod tests {
             wp::Ratings::from_csv("/dev/null").unwrap()
         });
         let mk = |inning, half: &str, outs, on1, on2, on3, a, h| PlayRow {
-            at_bat_index: 0, inning, half: half.into(), event: String::new(),
-            event_type: String::new(), rbi: 0, away_score: a, home_score: h,
-            is_scoring: false, end_time: String::new(), decisive_time: String::new(),
-            outs_after: outs, on1_after: on1, on2_after: on2, on3_after: on3,
+            at_bat_index: 0,
+            inning,
+            half: half.into(),
+            event: String::new(),
+            event_type: String::new(),
+            rbi: 0,
+            away_score: a,
+            home_score: h,
+            is_scoring: false,
+            end_time: String::new(),
+            decisive_time: String::new(),
+            outs_after: outs,
+            on1_after: on1,
+            on2_after: on2,
+            on3_after: on3,
         };
         // reference values from wp_model.py with neutral ratings
         let cases = [
@@ -647,8 +702,8 @@ mod tests {
 
     #[test]
     fn parses_gumbo_fixture() {
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/gumbo_fixture.json");
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/gumbo_fixture.json");
         if let Ok(s) = std::fs::read_to_string(fixture) {
             let v: serde_json::Value = serde_json::from_str(&s).unwrap();
             let plays = MlbClient::plays_from_gumbo(&v);

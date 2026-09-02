@@ -33,9 +33,9 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_exposure_cents: 2_500,      // $25 total at risk
-            per_market_cap_cents: 500,      // $5 per market
-            daily_loss_stop_cents: 500,     // -$5/day -> lockout
+            max_exposure_cents: 2_500,  // $25 total at risk
+            per_market_cap_cents: 500,  // $5 per market
+            daily_loss_stop_cents: 500, // -$5/day -> lockout
             max_orders_per_min: 10,
             max_price_distance_cents: 5,
         }
@@ -59,29 +59,70 @@ pub struct OrderCheck<'a> {
 /// never retries around one.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Veto {
-    ExposureCap { open_cents: i64, order_cents: i64, cap: i64 },
-    MarketCap { ticker: String, open_cents: i64, order_cents: i64, cap: i64 },
-    DailyLoss { realized_cents: i64, stop: i64 },
-    OrderRate { in_window: usize, cap: usize },
-    PriceDistance { price: i64, mid: f64, cap: i64 },
+    ExposureCap {
+        open_cents: i64,
+        order_cents: i64,
+        cap: i64,
+    },
+    MarketCap {
+        ticker: String,
+        open_cents: i64,
+        order_cents: i64,
+        cap: i64,
+    },
+    DailyLoss {
+        realized_cents: i64,
+        stop: i64,
+    },
+    OrderRate {
+        in_window: usize,
+        cap: usize,
+    },
+    PriceDistance {
+        price: i64,
+        mid: f64,
+        cap: i64,
+    },
     NoMid,
-    PriceBounds { price: i64 },
-    BadCount { count: i64 },
+    PriceBounds {
+        price: i64,
+    },
+    BadCount {
+        count: i64,
+    },
 }
 
 impl std::fmt::Display for Veto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Veto::ExposureCap { open_cents, order_cents, cap } => write!(
-                f, "total exposure cap: open {open_cents}c + order {order_cents}c > {cap}c"),
-            Veto::MarketCap { ticker, open_cents, order_cents, cap } => write!(
-                f, "per-market cap on {ticker}: open {open_cents}c + order {order_cents}c > {cap}c"),
-            Veto::DailyLoss { realized_cents, stop } => write!(
-                f, "daily loss stop: realized {realized_cents}c <= -{stop}c"),
-            Veto::OrderRate { in_window, cap } => write!(
-                f, "order rate: {in_window} in last 60s >= cap {cap}"),
+            Veto::ExposureCap {
+                open_cents,
+                order_cents,
+                cap,
+            } => write!(
+                f,
+                "total exposure cap: open {open_cents}c + order {order_cents}c > {cap}c"
+            ),
+            Veto::MarketCap {
+                ticker,
+                open_cents,
+                order_cents,
+                cap,
+            } => {
+                write!(
+                f, "per-market cap on {ticker}: open {open_cents}c + order {order_cents}c > {cap}c")
+            }
+            Veto::DailyLoss {
+                realized_cents,
+                stop,
+            } => write!(f, "daily loss stop: realized {realized_cents}c <= -{stop}c"),
+            Veto::OrderRate { in_window, cap } => {
+                write!(f, "order rate: {in_window} in last 60s >= cap {cap}")
+            }
             Veto::PriceDistance { price, mid, cap } => write!(
-                f, "price sanity: {price}c is more than {cap}c from mid {mid:.1}c"),
+                f,
+                "price sanity: {price}c is more than {cap}c from mid {mid:.1}c"
+            ),
             Veto::NoMid => write!(f, "no trustworthy mid for market"),
             Veto::PriceBounds { price } => write!(f, "price {price}c outside 1-99"),
             Veto::BadCount { count } => write!(f, "count {count} not a positive integer"),
@@ -106,7 +147,10 @@ pub struct RiskBook {
 
 impl RiskBook {
     pub fn new(limits: Limits) -> Self {
-        Self { limits, ..Default::default() }
+        Self {
+            limits,
+            ..Default::default()
+        }
     }
 
     /// Approve or veto an order the executor wants to send. On approval the
@@ -114,7 +158,9 @@ impl RiskBook {
     /// real send attempt).
     pub fn approve(&mut self, now: DateTime<Utc>, chk: &OrderCheck) -> Result<(), Veto> {
         if chk.price_cents < 1 || chk.price_cents > 99 {
-            return Err(Veto::PriceBounds { price: chk.price_cents });
+            return Err(Veto::PriceBounds {
+                price: chk.price_cents,
+            });
         }
         if chk.count <= 0 {
             return Err(Veto::BadCount { count: chk.count });
@@ -131,7 +177,8 @@ impl RiskBook {
         };
         if (chk.price_cents as f64 - mid).abs() > self.limits.max_price_distance_cents as f64 {
             return Err(Veto::PriceDistance {
-                price: chk.price_cents, mid,
+                price: chk.price_cents,
+                mid,
                 cap: self.limits.max_price_distance_cents,
             });
         }
@@ -143,15 +190,18 @@ impl RiskBook {
             + *self.pending.get(chk.ticker).unwrap_or(&0);
         if market_open + order_cents > self.limits.per_market_cap_cents {
             return Err(Veto::MarketCap {
-                ticker: chk.ticker.to_string(), open_cents: market_open,
-                order_cents, cap: self.limits.per_market_cap_cents,
+                ticker: chk.ticker.to_string(),
+                open_cents: market_open,
+                order_cents,
+                cap: self.limits.per_market_cap_cents,
             });
         }
-        let total_open: i64 = self.exposure.values().sum::<i64>()
-            + self.pending.values().sum::<i64>();
+        let total_open: i64 =
+            self.exposure.values().sum::<i64>() + self.pending.values().sum::<i64>();
         if total_open + order_cents > self.limits.max_exposure_cents {
             return Err(Veto::ExposureCap {
-                open_cents: total_open, order_cents,
+                open_cents: total_open,
+                order_cents,
                 cap: self.limits.max_exposure_cents,
             });
         }
@@ -160,7 +210,10 @@ impl RiskBook {
             self.sent.pop_front();
         }
         if self.sent.len() >= self.limits.max_orders_per_min {
-            return Err(Veto::OrderRate { in_window: self.sent.len(), cap: self.limits.max_orders_per_min });
+            return Err(Veto::OrderRate {
+                in_window: self.sent.len(),
+                cap: self.limits.max_orders_per_min,
+            });
         }
         self.sent.push_back(now);
         *self.pending.entry(chk.ticker.to_string()).or_insert(0) += order_cents;
@@ -172,7 +225,9 @@ impl RiskBook {
     pub fn release_pending(&mut self, ticker: &str, reserved_cents: i64) {
         if let Some(p) = self.pending.get_mut(ticker) {
             *p = (*p - reserved_cents).max(0);
-            if *p == 0 { self.pending.remove(ticker); }
+            if *p == 0 {
+                self.pending.remove(ticker);
+            }
         }
     }
 
@@ -188,11 +243,17 @@ impl RiskBook {
         if *e + delta_cents < 0 {
             // Clamped in the conservative direction, but drift means the
             // executor's accounting and ours disagree — make it visible.
-            tracing::warn!(ticker, open = *e, delta = delta_cents,
-                           "exposure over-decrement clamped to 0");
+            tracing::warn!(
+                ticker,
+                open = *e,
+                delta = delta_cents,
+                "exposure over-decrement clamped to 0"
+            );
         }
         *e = (*e + delta_cents).max(0);
-        if *e == 0 { self.exposure.remove(ticker); }
+        if *e == 0 {
+            self.exposure.remove(ticker);
+        }
     }
 
     /// A round trip / settlement realized P&L (negative = loss).
@@ -200,11 +261,15 @@ impl RiskBook {
         self.realized_today += pnl_cents;
     }
 
-    pub fn realized_today(&self) -> i64 { self.realized_today }
+    pub fn realized_today(&self) -> i64 {
+        self.realized_today
+    }
     pub fn daily_loss_hit(&self) -> bool {
         self.realized_today <= -self.limits.daily_loss_stop_cents
     }
-    pub fn open_exposure_cents(&self) -> i64 { self.exposure.values().sum() }
+    pub fn open_exposure_cents(&self) -> i64 {
+        self.exposure.values().sum()
+    }
 }
 
 // ---------------------------------------------------------------- lockout
@@ -255,8 +320,15 @@ pub struct DeadMan {
 }
 
 impl DeadMan {
-    pub fn new(max_age_s: i64) -> Self { Self { max_age_s, last: None } }
-    pub fn touch(&mut self, now: DateTime<Utc>) { self.last = Some(now); }
+    pub fn new(max_age_s: i64) -> Self {
+        Self {
+            max_age_s,
+            last: None,
+        }
+    }
+    pub fn touch(&mut self, now: DateTime<Utc>) {
+        self.last = Some(now);
+    }
     /// Stale when never touched, or last touch is older than the limit.
     pub fn is_stale(&self, now: DateTime<Utc>) -> bool {
         match self.last {
@@ -271,9 +343,16 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    fn t0() -> DateTime<Utc> { Utc.with_ymd_and_hms(2026, 9, 1, 18, 0, 0).unwrap() }
+    fn t0() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 9, 1, 18, 0, 0).unwrap()
+    }
     fn chk<'a>(ticker: &'a str, price: i64, count: i64) -> OrderCheck<'a> {
-        OrderCheck { ticker, price_cents: price, count, mid_cents: Some(price as f64) }
+        OrderCheck {
+            ticker,
+            price_cents: price,
+            count,
+            mid_cents: Some(price as f64),
+        }
     }
 
     #[test]
@@ -293,7 +372,9 @@ mod tests {
     #[test]
     fn vetoes_total_exposure() {
         let mut rb = RiskBook::new(Limits::default());
-        for m in ["A", "B", "C", "D", "E"] { rb.on_exposure_change(m, 480); }
+        for m in ["A", "B", "C", "D", "E"] {
+            rb.on_exposure_change(m, 480);
+        }
         let v = rb.approve(t0(), &chk("F", 40, 10)).unwrap_err();
         assert!(matches!(v, Veto::ExposureCap { .. }));
     }
@@ -311,12 +392,18 @@ mod tests {
     fn vetoes_order_rate() {
         let mut rb = RiskBook::new(Limits::default());
         for i in 0..10 {
-            assert!(rb.approve(t0() + chrono::Duration::seconds(i), &chk("A", 10, 1)).is_ok());
+            assert!(rb
+                .approve(t0() + chrono::Duration::seconds(i), &chk("A", 10, 1))
+                .is_ok());
         }
-        let v = rb.approve(t0() + chrono::Duration::seconds(11), &chk("A", 10, 1)).unwrap_err();
+        let v = rb
+            .approve(t0() + chrono::Duration::seconds(11), &chk("A", 10, 1))
+            .unwrap_err();
         assert!(matches!(v, Veto::OrderRate { .. }));
         // window slides: a minute later it approves again
-        assert!(rb.approve(t0() + chrono::Duration::seconds(130), &chk("A", 10, 1)).is_ok());
+        assert!(rb
+            .approve(t0() + chrono::Duration::seconds(130), &chk("A", 10, 1))
+            .is_ok());
     }
 
     #[test]
@@ -324,7 +411,10 @@ mod tests {
         let mut rb = RiskBook::new(Limits::default());
         let mut c = chk("A", 40, 1);
         c.mid_cents = Some(50.0);
-        assert!(matches!(rb.approve(t0(), &c).unwrap_err(), Veto::PriceDistance { .. }));
+        assert!(matches!(
+            rb.approve(t0(), &c).unwrap_err(),
+            Veto::PriceDistance { .. }
+        ));
         c.mid_cents = None;
         assert!(matches!(rb.approve(t0(), &c).unwrap_err(), Veto::NoMid));
     }
@@ -370,8 +460,10 @@ mod tests {
         assert!(rb.approve(t0(), &chk("A", 40, 10)).is_ok());
         // Fill converts reservation to real exposure — still capped.
         rb.on_fill_open("A", 400);
-        assert!(matches!(rb.approve(t0(), &chk("A", 40, 10)).unwrap_err(),
-                         Veto::MarketCap { .. }));
+        assert!(matches!(
+            rb.approve(t0(), &chk("A", 40, 10)).unwrap_err(),
+            Veto::MarketCap { .. }
+        ));
     }
 
     #[test]
@@ -380,10 +472,14 @@ mod tests {
         let mut c = chk("A", 40, 1);
         c.mid_cents = Some(f64::NAN);
         assert!(matches!(rb.approve(t0(), &c).unwrap_err(), Veto::NoMid));
-        assert!(matches!(rb.approve(t0(), &chk("A", 40, 0)).unwrap_err(),
-                         Veto::BadCount { .. }));
-        assert!(matches!(rb.approve(t0(), &chk("A", 40, -5)).unwrap_err(),
-                         Veto::BadCount { .. }));
+        assert!(matches!(
+            rb.approve(t0(), &chk("A", 40, 0)).unwrap_err(),
+            Veto::BadCount { .. }
+        ));
+        assert!(matches!(
+            rb.approve(t0(), &chk("A", 40, -5)).unwrap_err(),
+            Veto::BadCount { .. }
+        ));
     }
 
     #[test]
