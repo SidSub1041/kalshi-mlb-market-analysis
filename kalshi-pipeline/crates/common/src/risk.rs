@@ -53,6 +53,10 @@ pub struct OrderCheck<'a> {
     /// Current market mid in cents, if a fresh book exists. `None` is treated
     /// as "no trustworthy price" and vetoes the order.
     pub mid_cents: Option<f64>,
+    /// True only for an exchange-enforced reduce-only exit. It is still
+    /// subject to fresh-price and rate checks, but never reserves additional
+    /// exposure or gets blocked by an entry cap.
+    pub reduce_only: bool,
 }
 
 /// Why an order was refused. The executor logs the veto and moves on; it
@@ -165,7 +169,7 @@ impl RiskBook {
         if chk.count <= 0 {
             return Err(Veto::BadCount { count: chk.count });
         }
-        if self.realized_today <= -self.limits.daily_loss_stop_cents {
+        if !chk.reduce_only && self.realized_today <= -self.limits.daily_loss_stop_cents {
             return Err(Veto::DailyLoss {
                 realized_cents: self.realized_today,
                 stop: self.limits.daily_loss_stop_cents,
@@ -186,6 +190,20 @@ impl RiskBook {
         // Without the pending reservation, a burst of approvals could each
         // pass individually and blow through the caps once they all fill.
         let order_cents = chk.price_cents * chk.count;
+        if chk.reduce_only {
+            let cutoff = now - chrono::Duration::seconds(60);
+            while self.sent.front().is_some_and(|t| *t < cutoff) {
+                self.sent.pop_front();
+            }
+            if self.sent.len() >= self.limits.max_orders_per_min {
+                return Err(Veto::OrderRate {
+                    in_window: self.sent.len(),
+                    cap: self.limits.max_orders_per_min,
+                });
+            }
+            self.sent.push_back(now);
+            return Ok(());
+        }
         let market_open = *self.exposure.get(chk.ticker).unwrap_or(&0)
             + *self.pending.get(chk.ticker).unwrap_or(&0);
         if market_open + order_cents > self.limits.per_market_cap_cents {
@@ -352,6 +370,7 @@ mod tests {
             price_cents: price,
             count,
             mid_cents: Some(price as f64),
+            reduce_only: false,
         }
     }
 
@@ -489,5 +508,14 @@ mod tests {
         dm.touch(t0());
         assert!(!dm.is_stale(t0() + chrono::Duration::seconds(29)));
         assert!(dm.is_stale(t0() + chrono::Duration::seconds(31)));
+    }
+
+    #[test]
+    fn allows_reduce_only_exit_after_loss_stop() {
+        let mut rb = RiskBook::new(Limits::default());
+        rb.on_realized(-500);
+        let mut close = chk("A", 40, 1);
+        close.reduce_only = true;
+        assert!(rb.approve(t0(), &close).is_ok());
     }
 }

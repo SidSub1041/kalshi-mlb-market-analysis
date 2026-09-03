@@ -51,8 +51,13 @@ pub struct LimitOrder<'a> {
     pub price: &'a str,
     /// Use `good_till_canceled` for a maker order or `fill_or_kill` for a cross.
     pub time_in_force: &'a str,
+    /// Kalshi's V2 self-trade policy. The executor always uses
+    /// `taker_at_cross` so it cannot take its own resting liquidity.
+    pub self_trade_prevention_type: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_only: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_order_on_pause: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reduce_only: Option<bool>,
 }
@@ -76,6 +81,10 @@ impl<'a> LimitOrder<'a> {
         anyhow::ensure!(
             matches!(self.time_in_force, "good_till_canceled" | "fill_or_kill"),
             "unsupported time_in_force"
+        );
+        anyhow::ensure!(
+            matches!(self.self_trade_prevention_type, "taker_at_cross" | "maker"),
+            "unsupported self_trade_prevention_type"
         );
         Ok(())
     }
@@ -143,6 +152,14 @@ impl OrderClient {
             .await
     }
 
+    /// Cancel every resting event-market order for this API key. This is used
+    /// only during controlled reconciliation and emergency shutdown; callers
+    /// must refetch `resting_orders` afterwards to verify the exchange state.
+    pub async fn cancel_all_orders(&self) -> Result<Value> {
+        self.json(self.signed("DELETE", EVENT_ORDERS)?, "cancel all orders")
+            .await
+    }
+
     /// Query one order. Kalshi currently serves reads at the portfolio path.
     pub async fn get_order(&self, order_id: &str) -> Result<Value> {
         valid_order_id(order_id)?;
@@ -177,7 +194,9 @@ mod tests {
             count: "1.00",
             price: "0.42",
             time_in_force: "good_till_canceled",
+            self_trade_prevention_type: "taker_at_cross",
             post_only: Some(true),
+            cancel_order_on_pause: Some(true),
             reduce_only: None
         }
         .validate()
@@ -193,7 +212,9 @@ mod tests {
             count: "1.00",
             price: "0.42",
             time_in_force: "good_till_canceled",
+            self_trade_prevention_type: "taker_at_cross",
             post_only: None,
+            cancel_order_on_pause: None,
             reduce_only: None,
         };
         assert!(order.validate().is_err());

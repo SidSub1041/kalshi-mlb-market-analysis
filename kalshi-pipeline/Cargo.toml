@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/common", "crates/collector", "crates/paper-trader"]
+members = ["crates/common", "crates/collector", "crates/paper-trader", "crates/executor"]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

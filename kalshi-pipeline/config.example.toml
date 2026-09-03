@@ -5,7 +5,7 @@
 key_id = "your-key-id-here"
 private_key_path = "kalshi_private_key.pem"
 
-size = 10.0            # contracts per signal
+size = 1.0             # contracts per signal; keep at 1 through demo validation
 hold_minutes = 5       # drift horizon from the pilot study
 exit_timeout_s = 120   # maker exit wait before crossing the spread
 max_spread_cents = 2   # skip signals on wide books
@@ -28,3 +28,10 @@ max_orders_per_min = 10
 max_price_distance_cents = 5
 adopt_positions_on_boot = false
 balance_floor_cents = 0
+
+# Executor input and safety controls. The executor reads a fresh strategy
+# snapshot at intent_path; an old or missing snapshot cancels and flattens.
+intent_path = "desired_positions.json"
+run_dir = "."
+stale_data_seconds = 30
+poll_seconds = 5

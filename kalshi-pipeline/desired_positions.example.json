@@ -1,0 +1,15 @@
+{
+  "book_updated_at_ms": 0,
+  "game_updated_at_ms": 0,
+  "intents": [
+    {
+      "ticker": "REPLACE_WITH_DEMO_MARKET_TICKER",
+      "client_order_id": "4b7bced8-21d4-4d75-a485-09260fec7964",
+      "target_contracts": 1,
+      "limit_price_cents": 42,
+      "mid_price_cents": 42.0,
+      "time_in_force": "good_till_canceled",
+      "post_only": true
+    }
+  ]
+}
