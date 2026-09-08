@@ -281,6 +281,7 @@ pub mod risk;
 pub mod auth {
     use anyhow::{Context, Result};
     use base64::Engine;
+    use rsa::pkcs1::DecodeRsaPrivateKey;
     use rsa::pkcs8::DecodePrivateKey;
     use rsa::pss::SigningKey;
     use rsa::sha2::Sha256;
@@ -297,8 +298,13 @@ pub mod auth {
         pub fn from_pem_file(key_id: &str, path: &str) -> Result<Self> {
             let pem = std::fs::read_to_string(path)
                 .with_context(|| format!("reading private key {path}"))?;
+            // Kalshi keys are RSA PEMs, but installations encounter both the
+            // modern PKCS#8 `BEGIN PRIVATE KEY` wrapper and the traditional
+            // PKCS#1 `BEGIN RSA PRIVATE KEY` wrapper. Accept either without
+            // requiring a user to manually convert their downloaded key.
             let key = RsaPrivateKey::from_pkcs8_pem(&pem)
-                .context("parsing PKCS#8 PEM private key (export the key Kalshi gave you)")?;
+                .or_else(|_| RsaPrivateKey::from_pkcs1_pem(&pem))
+                .context("parsing RSA PEM private key (expected PKCS#8 or PKCS#1)")?;
             Ok(Self {
                 key_id: key_id.to_string(),
                 key,
