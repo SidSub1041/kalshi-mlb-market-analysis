@@ -8,8 +8,11 @@ use crate::auth::Signer;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
+use std::time::Duration;
 
 const EVENT_ORDERS: &str = "/portfolio/events/orders";
+const ORDER_LOOKUP_ATTEMPTS: usize = 6;
+const ORDER_LOOKUP_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Proof that the process was deliberately enabled to submit orders. The
 /// token's fields are private: callers must pass the two-key production gate
@@ -113,6 +116,13 @@ impl OrderClient {
 
     fn signed(&self, method: &str, rel: &str) -> Result<reqwest::RequestBuilder> {
         let url = reqwest::Url::parse(&format!("{}{}", self.api_base, rel)).context("order url")?;
+        self.signed_url(method, url)
+    }
+
+    /// Sign a request after its query parameters have been added. Kalshi signs
+    /// the path, not the query string, so this preserves the standard signing
+    /// behavior while allowing shard auto-routing parameters.
+    fn signed_url(&self, method: &str, url: reqwest::Url) -> Result<reqwest::RequestBuilder> {
         let (ts, sig) = self.signer.headers(method, url.path())?;
         Ok(self
             .http
@@ -120,6 +130,20 @@ impl OrderClient {
             .header("KALSHI-ACCESS-KEY", &self.signer.key_id)
             .header("KALSHI-ACCESS-SIGNATURE", sig)
             .header("KALSHI-ACCESS-TIMESTAMP", ts))
+    }
+
+    /// Route an order-specific request to its matching-engine shard using the
+    /// market ticker. An order ID by itself cannot identify that shard.
+    fn signed_for_market_ticker(
+        &self,
+        method: &str,
+        rel: &str,
+        market_ticker: &str,
+    ) -> Result<reqwest::RequestBuilder> {
+        let mut url = reqwest::Url::parse(&format!("{}{}", self.api_base, rel))
+            .context("routed order url")?;
+        add_market_ticker(&mut url, market_ticker)?;
+        self.signed_url(method, url)
     }
 
     async fn json(&self, request: reqwest::RequestBuilder, action: &str) -> Result<Value> {
@@ -144,12 +168,16 @@ impl OrderClient {
         self.json(request, "create order").await
     }
 
-    /// Cancel one V2 event-market order.
-    pub async fn cancel_order(&self, order_id: &str) -> Result<Value> {
+    /// Cancel one V2 event-market order. Supplying its market ticker makes
+    /// Kalshi auto-route this request to the market's exchange shard.
+    pub async fn cancel_order(&self, order_id: &str, market_ticker: &str) -> Result<Value> {
         valid_order_id(order_id)?;
         let rel = format!("{EVENT_ORDERS}/{order_id}");
-        self.json(self.signed("DELETE", &rel)?, "cancel order")
-            .await
+        self.json(
+            self.signed_for_market_ticker("DELETE", &rel, market_ticker)?,
+            "cancel order",
+        )
+        .await
     }
 
     /// Cancel every resting event-market order for this API key. This is used
@@ -160,11 +188,33 @@ impl OrderClient {
             .await
     }
 
-    /// Query one order. Kalshi currently serves reads at the portfolio path.
-    pub async fn get_order(&self, order_id: &str) -> Result<Value> {
+    /// Query one order. Its market ticker enables shard auto-routing. A newly
+    /// created order can take a moment to become visible on the read path, so
+    /// retry a short, bounded number of shard-aware 404 responses.
+    pub async fn get_order(&self, order_id: &str, market_ticker: &str) -> Result<Value> {
         valid_order_id(order_id)?;
         let rel = format!("/portfolio/orders/{order_id}");
-        self.json(self.signed("GET", &rel)?, "get order").await
+        for attempt in 0..ORDER_LOOKUP_ATTEMPTS {
+            let response = self
+                .signed_for_market_ticker("GET", &rel, market_ticker)?
+                .send()
+                .await
+                .context("get order")?;
+            let status = response.status();
+            let body = response.text().await.context("order response body")?;
+            if status == reqwest::StatusCode::NOT_FOUND && attempt + 1 < ORDER_LOOKUP_ATTEMPTS {
+                tokio::time::sleep(ORDER_LOOKUP_RETRY_DELAY).await;
+                continue;
+            }
+            if !status.is_success() {
+                anyhow::bail!(
+                    "get order -> {status}: {}",
+                    body.chars().take(500).collect::<String>()
+                );
+            }
+            return serde_json::from_str(&body).context("order response json");
+        }
+        unreachable!("order lookup loop always returns or errors")
     }
 }
 
@@ -178,6 +228,13 @@ fn valid_order_id(order_id: &str) -> Result<()> {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
         "order_id contains unsafe path characters"
     );
+    Ok(())
+}
+
+fn add_market_ticker(url: &mut reqwest::Url, market_ticker: &str) -> Result<()> {
+    anyhow::ensure!(!market_ticker.is_empty(), "market_ticker is empty");
+    url.query_pairs_mut()
+        .append_pair("market_ticker", market_ticker);
     Ok(())
 }
 
@@ -221,6 +278,20 @@ mod tests {
         order.client_order_id = "intent-1";
         order.price = "1.00";
         assert!(order.validate().is_err());
+    }
+
+    #[test]
+    fn encodes_market_ticker_for_shard_auto_routing() {
+        let mut url = reqwest::Url::parse(
+            "https://external-api.demo.kalshi.co/trade-api/v2/portfolio/events/orders/order-1",
+        )
+        .unwrap();
+        add_market_ticker(&mut url, "KXTEST-X/Y").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://external-api.demo.kalshi.co/trade-api/v2/portfolio/events/orders/order-1?market_ticker=KXTEST-X%2FY"
+        );
+        assert!(add_market_ticker(&mut url, "").is_err());
     }
 
     #[test]

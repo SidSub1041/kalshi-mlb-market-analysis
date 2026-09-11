@@ -235,16 +235,42 @@ async fn smoke(
     let order_id = created["order_id"]
         .as_str()
         .context("create response missing order_id")?;
-    let queried = orders.get_order(order_id).await?;
+    let queried = match orders.get_order(order_id, ticker).await {
+        Ok(queried) => queried,
+        Err(get_error) => {
+            if let Err(cancel_error) = orders.cancel_order(order_id, ticker).await {
+                return Err(get_error).context(format!(
+                    "demo smoke lookup failed and cleanup failed: {cancel_error}"
+                ));
+            }
+            return Err(get_error).context("demo smoke lookup failed; test order was cancelled");
+        }
+    };
     tracing::info!(%ticker, %order_id, response = %queried, "demo smoke order exists; cancelling");
-    orders.cancel_order(order_id).await?;
-    let remaining = portfolio.resting_orders().await?;
-    anyhow::ensure!(
-        !remaining.iter().any(|(id, _, _)| id == order_id),
-        "cancel has not settled; rerun only after reconciliation"
-    );
+    orders.cancel_order(order_id, ticker).await?;
+    wait_for_order_cancelled(portfolio, order_id).await?;
     tracing::info!(%order_id, "demo smoke test passed: created, queried, and cancelled exactly one order");
     Ok(())
+}
+
+/// The write response can arrive before the portfolio read model reflects a
+/// cancellation. Confirm that a specific smoke order is absent before calling
+/// the test successful, without touching any other resting orders.
+async fn wait_for_order_cancelled(portfolio: &PortfolioClient, order_id: &str) -> Result<()> {
+    for attempt in 0..3 {
+        if !portfolio
+            .resting_orders()
+            .await?
+            .iter()
+            .any(|(id, _, _)| id == order_id)
+        {
+            return Ok(());
+        }
+        if attempt < 2 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    bail!("cancel has not settled after reconciliation wait")
 }
 
 async fn run(
@@ -343,7 +369,7 @@ async fn reconcile(
                 .get(id)
                 .is_some_and(|intent| intent.target_contracts != current);
             if !still_needed {
-                orders.cancel_order(order_id).await?;
+                orders.cancel_order(order_id, ticker).await?;
             }
         }
     }
