@@ -676,8 +676,24 @@ async fn run_day(
     // feed-health telemetry: what the loop actually receives, logged each minute
     let (mut n_snap, mut n_delta, mut n_trade) = (0u64, 0u64, 0u64);
     let mut last_stats = Utc::now();
+    // The executor must receive a fresh empty snapshot even before the first
+    // model/book pair is ready. Once there are active intents, the writer
+    // retains their source timestamps, so its existing stale-data guard still
+    // stops execution when either feed goes quiet.
+    let mut intent_heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
+    write_executor_intents(cfg, &positions)?;
 
-    while let Some(tick) = rx.recv().await {
+    loop {
+        let tick = tokio::select! {
+            maybe_tick = rx.recv() => match maybe_tick {
+                Some(tick) => tick,
+                None => break,
+            },
+            _ = intent_heartbeat.tick() => {
+                write_executor_intents(cfg, &positions)?;
+                continue;
+            }
+        };
         let now = Utc::now();
         if (now - last_stats).num_seconds() >= 60 {
             let sample = books
