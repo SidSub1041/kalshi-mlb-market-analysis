@@ -39,6 +39,9 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Verify credentials and portfolio state using authenticated GET requests
+    /// only. This command never creates an OrderClient or submits an order.
+    Preflight,
     /// Reconcile then continuously converge on the desired-position file.
     Run,
     /// Place, query, and cancel one deliberately resting 1-contract DEMO order.
@@ -167,19 +170,24 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let cfg: Config = toml::from_str(&std::fs::read_to_string(&args.config)?)
         .context("parsing executor config")?;
+    let signer = Signer::from_pem_file(&cfg.key_id, &cfg.private_key_path)?;
+    let portfolio = PortfolioClient::new(signer.clone(), &cfg.api_base)?;
+
+    if matches!(&args.command, Command::Preflight) {
+        return preflight(&cfg, &portfolio).await;
+    }
     if risk::is_locked_out(&cfg.run_dir, Utc::now()) {
         bail!(
             "today's LOCKOUT file exists in {}; refusing to start",
             cfg.run_dir.display()
         );
     }
-    let signer = Signer::from_pem_file(&cfg.key_id, &cfg.private_key_path)?;
     let permission =
         TradingPermission::authorize(&cfg.api_base, cfg.live_enabled, cfg.confirm_prod)?;
-    let portfolio = PortfolioClient::new(signer.clone(), &cfg.api_base)?;
     let orders = OrderClient::new(signer.clone(), &cfg.api_base, permission)?;
 
     match args.command {
+        Command::Preflight => unreachable!("preflight returned before constructing OrderClient"),
         Command::Smoke {
             ticker,
             price_cents,
@@ -200,6 +208,44 @@ fn is_production(api_base: &str) -> bool {
                 "external-api.kalshi.com" | "api.elections.kalshi.com"
             )
         })
+}
+
+/// Make the production readiness check possible without weakening the two-key
+/// order gate. `PortfolioClient` exposes authenticated GET requests only.
+async fn preflight(cfg: &Config, portfolio: &PortfolioClient) -> Result<()> {
+    let balance = portfolio.balance_cents().await?;
+    let positions = portfolio.positions().await?;
+    let resting_orders = portfolio.resting_orders().await?;
+    let environment = if is_production(&cfg.api_base) {
+        "production"
+    } else {
+        "demo_or_custom"
+    };
+    tracing::info!(
+        %environment,
+        balance_cents = balance,
+        open_positions = positions.len(),
+        resting_orders = resting_orders.len(),
+        live_enabled = cfg.live_enabled,
+        confirm_prod = cfg.confirm_prod,
+        "read-only portfolio preflight passed"
+    );
+    if is_production(&cfg.api_base) {
+        if cfg.live_enabled && cfg.confirm_prod {
+            tracing::warn!(
+                "production order gates are enabled; preflight itself submitted no orders"
+            );
+        } else {
+            tracing::info!("production order submission remains gated");
+        }
+    } else if cfg.live_enabled {
+        tracing::info!(
+            "demo order submission would be enabled if executor is run; preflight submitted no orders"
+        );
+    } else {
+        tracing::info!("order submission remains gated");
+    }
+    Ok(())
 }
 
 async fn smoke(

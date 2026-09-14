@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.sid.kalshi-executor</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/sid/live/kalshi-live/kalshi-pipeline/target/release/kalshi-executor</string>
+    <string>--config</string>
+    <string>config.toml</string>
+    <string>run</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/sid/live/kalshi-live/kalshi-pipeline</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Do not restart when the local emergency KILL marker exists. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>PathState</key>
+    <dict>
+      <key>/Users/sid/live/kalshi-live/kalshi-pipeline/KILL</key>
+      <false/>
+    </dict>
+  </dict>
+
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/sid/Library/Logs/kalshi-executor.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/sid/Library/Logs/kalshi-executor.log</string>
+</dict>
+</plist>

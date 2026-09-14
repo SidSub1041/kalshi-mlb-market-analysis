@@ -1,4 +1,6 @@
-# Paper-trader config. Copy to config.toml and fill in.
+# Shared paper-trader and executor config. Copy to the ignored local
+# config.toml and fill in. For a production-ready starting point, see
+# config.live.example.toml.
 # Get an API key at kalshi.com -> Account -> API keys. Download the RSA private
 # key file; NEVER commit it or paste it into chat.
 
@@ -17,8 +19,8 @@ log_path = "paper_trades.csv"
 api_base = "https://external-api.demo.kalshi.co/trade-api/v2"
 ws_base = "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2"
 
-# Live execution is deliberately disabled. These values are consumed by the
-# future executor, not the paper-trader binary.
+# Live execution is deliberately disabled. `kalshi-executor preflight` can
+# authenticate and inspect portfolio state while both remain false.
 live_enabled = false
 confirm_prod = false
 max_exposure_cents = 2500

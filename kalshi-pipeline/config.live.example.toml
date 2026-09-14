@@ -1,0 +1,39 @@
+# Production executor configuration template.
+#
+# Copy the non-secret settings into your local `config.toml` (which is ignored
+# by git). Do not commit a real key ID or PEM path. Start with both order gates
+# false and run `kalshi-executor --config config.toml preflight` first.
+
+key_id = "REPLACE_WITH_PRODUCTION_KEY_ID"
+private_key_path = "/Users/sid/.config/kalshi/kalshi-production-private-key.pem"
+
+# Kalshi's production Trade API endpoints.
+api_base = "https://external-api.kalshi.com/trade-api/v2"
+ws_base = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
+
+# These must BOTH be changed to true before the executor can submit a
+# production order. Leave both false for preflight and paper-trader operation.
+live_enabled = false
+confirm_prod = false
+
+# Conservative first-live-session limits: at most one $1 contract of exposure
+# and a $1 daily loss stop. Deliberately increase only after observing a full
+# live session and choosing a new risk budget.
+balance_floor_cents = 100
+max_exposure_cents = 100
+per_market_cap_cents = 100
+daily_loss_stop_cents = 100
+max_orders_per_min = 1
+max_price_distance_cents = 2
+adopt_positions_on_boot = false
+
+# The paper trader writes these fresh desired-position snapshots for the
+# executor. Stale or missing data makes the executor cancel/flatten and stop.
+intent_path = "desired_positions.json"
+run_dir = "."
+stale_data_seconds = 30
+poll_seconds = 5
+
+# Paper-trader settings. Its remaining settings use the safe code defaults.
+size = 1.0
+log_path = "paper_trades.production.csv"
