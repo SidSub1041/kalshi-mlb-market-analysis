@@ -146,16 +146,30 @@ impl OrderClient {
         self.signed_url(method, url)
     }
 
-    async fn json(&self, request: reqwest::RequestBuilder, action: &str) -> Result<Value> {
+    async fn response_body(
+        &self,
+        request: reqwest::RequestBuilder,
+        action: &str,
+    ) -> Result<(reqwest::StatusCode, String)> {
         let response = request.send().await.context(action.to_owned())?;
         let status = response.status();
         let body = response.text().await.context("order response body")?;
+        Ok((status, body))
+    }
+
+    fn ensure_success(status: reqwest::StatusCode, body: &str, action: &str) -> Result<()> {
         if !status.is_success() {
             anyhow::bail!(
                 "{action} -> {status}: {}",
                 body.chars().take(500).collect::<String>()
             );
         }
+        Ok(())
+    }
+
+    async fn json(&self, request: reqwest::RequestBuilder, action: &str) -> Result<Value> {
+        let (status, body) = self.response_body(request, action).await?;
+        Self::ensure_success(status, &body, action)?;
         serde_json::from_str(&body).context("order response json")
     }
 
@@ -183,9 +197,11 @@ impl OrderClient {
     /// Cancel every resting event-market order for this API key. This is used
     /// only during controlled reconciliation and emergency shutdown; callers
     /// must refetch `resting_orders` afterwards to verify the exchange state.
-    pub async fn cancel_all_orders(&self) -> Result<Value> {
-        self.json(self.signed("DELETE", EVENT_ORDERS)?, "cancel all orders")
-            .await
+    pub async fn cancel_all_orders(&self) -> Result<()> {
+        let (status, body) = self
+            .response_body(self.signed("DELETE", EVENT_ORDERS)?, "cancel all orders")
+            .await?;
+        Self::ensure_success(status, &body, "cancel all orders")
     }
 
     /// Query one order. Its market ticker enables shard auto-routing. A newly
@@ -320,5 +336,28 @@ mod tests {
             false
         )
         .is_ok());
+    }
+
+    #[test]
+    fn accepts_empty_no_content_cancel_response() {
+        assert!(OrderClient::ensure_success(
+            reqwest::StatusCode::NO_CONTENT,
+            "",
+            "cancel all orders"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn retains_cancel_error_body() {
+        let error = OrderClient::ensure_success(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "signature rejected",
+            "cancel all orders",
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("401 Unauthorized: signature rejected"));
     }
 }
